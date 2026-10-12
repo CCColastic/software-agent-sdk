@@ -17,9 +17,18 @@ import os
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    FastAPI,
+    HTTPException,
+    Request,
+    WebSocketException,
+    status,
+)
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from starlette.requests import HTTPConnection
 
 from openhands.agent_server.bash_service import BashEventService
 from openhands.agent_server.config import Config, TelemetrySpec, WebhookSpec
@@ -34,6 +43,7 @@ from openhands.agent_server.telemetry import (
     emit_server_started,
     shutdown_telemetry_sink,
 )
+from openhands.agent_server.vscode_service import get_vscode_service
 from openhands.sdk.logger import get_logger
 from openhands.sdk.observability import maybe_init_laminar
 
@@ -222,6 +232,13 @@ class InitService:
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"server already in state: {self._state}",
                 )
+            if req.session_api_keys is not None and any(
+                not key for key in req.session_api_keys
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="session_api_keys cannot contain empty keys",
+                )
             self._state = "initializing"
             self._error = None
         try:
@@ -270,6 +287,15 @@ class InitService:
 
             new_root_path = _get_root_path(new_config)
             self._app.root_path = new_root_path
+
+            # VSCode's token is the first session key, as on a normal boot. A
+            # dormant server that booted without one gave VSCode a random
+            # token, so switch it to the key delivered here.
+            vscode_service = get_vscode_service()
+            if vscode_service is not None and new_config.session_api_keys:
+                await vscode_service.set_connection_token(
+                    new_config.session_api_keys[0]
+                )
 
             mark_initialization_complete()
             self._state = "ready"
@@ -334,22 +360,26 @@ def check_init_api_key(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
 
 
-def require_initialized(request: Request) -> None:
-    """Dependency that 503s every /api/* route while the server is dormant.
+def require_initialized(connection: HTTPConnection) -> None:
+    """Dependency that rejects requests and WebSockets while the server is dormant.
 
-    Returns immediately when ``deferred_init`` is False (the normal path) so
-    this has zero cost for non-deferred deployments.
+    HTTP requests get a 503; WebSockets are closed with 1013 (Try Again Later)
+    before the handshake is accepted. Returns immediately when
+    ``deferred_init`` is False (the normal path) so this has zero cost for
+    non-deferred deployments.
     """
-    init_service: InitService | None = getattr(request.app.state, "init_service", None)
+    init_service: InitService | None = getattr(
+        connection.app.state, "init_service", None
+    )
     if init_service is None or init_service.state == "ready":
         return
-    raise HTTPException(
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        detail=(
-            f"server is in deferred-init state '{init_service.state}'; "
-            "call POST /api/init first"
-        ),
+    reason = (
+        f"server is in deferred-init state '{init_service.state}'; "
+        "call POST /api/init first"
     )
+    if connection.scope["type"] == "websocket":
+        raise WebSocketException(code=status.WS_1013_TRY_AGAIN_LATER, reason=reason)
+    raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=reason)
 
 
 init_router = APIRouter(prefix="/init", tags=["Init"])

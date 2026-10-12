@@ -1,8 +1,11 @@
 import sys
 from unittest.mock import patch
 
+import litellm
+
 from openhands.sdk.llm.utils.unverified_models import (
     _list_bedrock_foundation_models,
+    get_supported_llm_models,
     get_unverified_models,
 )
 from openhands.sdk.llm.utils.verified_models import (
@@ -126,6 +129,40 @@ def test_kimi_k3_and_claude_opus_5_are_verified():
     assert "claude-opus-5" in VERIFIED_OPENHANDS_MODELS
 
 
+def test_openrouter_is_a_verified_provider():
+    """OpenRouter must be a verified provider (alongside openai/openhands) so the
+    provider picker shows it as verified on the local backend. Its entries are
+    namespaced ids with the ``openrouter/`` prefix stripped.
+    """
+    assert "openrouter" in VERIFIED_MODELS
+    # The picker treats any key in VERIFIED_MODELS as a verified provider, so a
+    # non-empty list is required for the OpenRouter section to render models.
+    assert VERIFIED_MODELS["openrouter"]
+    assert "anthropic/claude-opus-5" in VERIFIED_MODELS["openrouter"]
+    assert "openai/gpt-6-astra" in VERIFIED_MODELS["openrouter"]
+    # Entries must be real catalog ids (no alias-only ids like ``openai/gpt-5.6``).
+    assert "openai/gpt-5.6-sol" in VERIFIED_MODELS["openrouter"]
+    # Entries must not carry the openrouter/ prefix (it is the provider key).
+    assert not any(m.startswith("openrouter/") for m in VERIFIED_MODELS["openrouter"])
+
+
+def test_openrouter_models_remain_discoverable_without_litellm_catalog(monkeypatch):
+    monkeypatch.setattr(
+        litellm,
+        "model_list",
+        ["deepseek/deepseek-chat", "bedrock/anthropic.claude-3"],
+    )
+    monkeypatch.setattr(litellm, "model_cost", {})
+
+    models = get_supported_llm_models()
+
+    assert "openrouter/deepseek/deepseek-chat" in models
+    assert "deepseek/deepseek-chat" in models
+    assert "bedrock/anthropic.claude-3" not in models
+    assert "openrouter/openai/gpt-5.6" not in models
+    assert "openrouter" not in get_unverified_models()
+
+
 def test_nemotron_3_super_uses_full_infra_name():
     """The verified Nemotron Super entry must match the infra model name
     (``nemotron-3-super-120b-a12b``) and the short alias should not be listed.
@@ -157,7 +194,10 @@ def test_verified_lists_keep_two_latest_versions_per_line():
     """
     expectations = {
         "openai": ({"gpt-6-astra", "gpt-5.6"}, {"gpt-5.5", "gpt-5.4", "gpt-4o", "o3"}),
-        "anthropic": ({"claude-opus-5", "claude-opus-4-8"}, {"claude-opus-4-7"}),
+        "anthropic": (
+            {"claude-opus-5-5", "claude-opus-5"},
+            {"claude-opus-4-8", "claude-opus-4-7"},
+        ),
         "mistral": (
             {"devstral-2512", "devstral-medium-2512"},
             {"devstral-medium-2507"},
@@ -169,14 +209,26 @@ def test_verified_lists_keep_two_latest_versions_per_line():
         "glm": ({"glm-5.3", "glm-5.2"}, {"glm-5.1"}),
         "nvidia": ({"nemotron-3.5-lightning-30b-a3b", "nemotron-3-nano"}, set()),
         "qwen": ({"qwen3.8-max", "qwen3.7-max"}, {"qwen3-max", "qwen3-6-plus"}),
+        # OpenRouter routes other vendors' models, so entries are namespaced
+        # ids (``anthropic/claude-opus-5``) rather than bare model names.
+        "openrouter": (
+            {"anthropic/claude-opus-5", "openai/gpt-6-astra"},
+            {"anthropic/claude-opus-4-7"},
+        ),
+        "digitalocean": (
+            {"anthropic-claude-opus-5.5", "anthropic-claude-opus-5"},
+            {"anthropic-claude-opus-4.8", "openai-gpt-6-astra"},
+        ),
     }
     assert set(expectations) == set(VERIFIED_MODELS) - {"openhands"}
     for provider, (present, absent) in expectations.items():
         models = set(VERIFIED_MODELS[provider])
         assert present <= models, f"{provider}: missing {present - models}"
         assert not (absent & models), f"{provider}: stale {absent & models}"
-    assert {"gpt-6-astra", "gpt-5.6", "claude-opus-5"} <= set(VERIFIED_OPENHANDS_MODELS)
-    assert not {"gpt-5.5", "claude-opus-4-7", "minimax-m2.5"} & set(
+    assert {"gpt-6-astra", "gpt-5.6", "claude-opus-5-5", "claude-opus-5"} <= set(
+        VERIFIED_OPENHANDS_MODELS
+    )
+    assert not {"gpt-5.5", "claude-opus-4-8", "claude-opus-4-7", "minimax-m2.5"} & set(
         VERIFIED_OPENHANDS_MODELS
     )
 

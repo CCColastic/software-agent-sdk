@@ -118,8 +118,14 @@ def test_python_image_uses_canonical_minimal_runtime() -> None:
     workflow_text = SERVER_WORKFLOW.read_text(encoding="utf-8")
 
     assert "FROM debian:trixie-slim AS python-node-runtime" in dockerfile_text
-    assert "FROM python:3.13.15-slim-trixie AS python-runtime" in dockerfile_text
-    assert "FROM node:24.21.0-trixie-slim AS node-runtime" in dockerfile_text
+    assert re.search(
+        r"(?m)^FROM python:\d+\.\d+\.\d+-slim-trixie AS python-runtime$",
+        dockerfile_text,
+    )
+    assert re.search(
+        r"(?m)^FROM node:\d+\.\d+\.\d+-trixie-slim AS node-runtime$",
+        dockerfile_text,
+    )
     assert "ARG BASE_IMAGE=python-node-runtime" in dockerfile_text
     assert re.search(r"ARG DEBIAN_SNAPSHOT=\d{8}T000000Z", dockerfile_text)
     assert (
@@ -151,6 +157,22 @@ def test_python_image_uses_canonical_minimal_runtime() -> None:
     assert "nikolaik/python-nodejs" not in dockerfile_text
     assert "base_image: python-node-runtime" in workflow_text
     assert "nikolaik/python-nodejs" not in workflow_text
+
+
+def test_agent_server_uses_one_pinned_npm_version_for_both_node_runtimes() -> None:
+    dockerfile_text = AGENT_SERVER_DOCKERFILE.read_text(encoding="utf-8")
+
+    match = re.search(r"(?m)^ARG NPM_VERSION=(\d+\.\d+\.\d+)$", dockerfile_text)
+    assert match
+    assert dockerfile_text.count("ARG NPM_VERSION\n") == 2
+    assert (
+        "node /usr/local/lib/node_modules/npm/bin/npm-cli.js install --global "
+        '"npm@${NPM_VERSION}"' in dockerfile_text
+    )
+    assert (
+        '"$ACP_NODE_DIR/bin/npm" install --global "npm@${NPM_VERSION}"'
+        in dockerfile_text
+    )
 
 
 def test_agent_server_dockerfile_has_no_hardcoded_acp_packages() -> None:
@@ -228,16 +250,23 @@ def test_default_preinstalled_acp_providers_matches_dockerfile_and_workflow() ->
     assert f"'{default_csv}'" in workflow_text
 
 
-def test_server_workflow_publishes_python_slim_without_acp_providers() -> None:
+def test_server_workflow_publishes_python_slim_without_optional_extras() -> None:
     workflow_text = SERVER_WORKFLOW.read_text(encoding="utf-8")
 
-    assert re.search(
+    slim_entries = re.findall(
         r"- variant: python-slim\n"
         r"\s+custom_tags: python\n"
         r"\s+image_flavor: slim\n"
-        r"\s+acp_provider_flavor: none",
+        r"\s+acp_provider_flavor: none\n"
+        r"\s+install_capabilities: browser,docker\n"
+        r"\s+enable_vscode: 'false'\n"
+        r"\s+target: binary\n"
+        r"\s+arch: (amd64|arm64)",
         workflow_text,
     )
+    assert slim_entries == ["amd64", "arm64"]
+    assert 'elif [ -n "${{ matrix.install_capabilities }}" ]; then' in workflow_text
+    assert "ENABLE_VSCODE=${{ env.ENABLE_VSCODE }}" in workflow_text
     assert (
         "INSTALL_ACP_PROVIDERS=${{ steps.prep.outputs.install_acp_providers }}"
         in workflow_text
