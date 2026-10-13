@@ -355,8 +355,9 @@ def test_download_trajectory_uses_python_zipfile(client, monkeypatch, tmp_path):
     (nested_dir / "event.json").write_text('{"id": "event-1"}')
 
     monkeypatch.setattr(
-        "openhands.agent_server.file_router.get_default_config",
-        lambda: Config(session_api_keys=[], conversations_path=conversations_path),
+        client.app.state,
+        "config",
+        Config(session_api_keys=[], conversations_path=conversations_path),
     )
 
     async def fail_if_shell_zip_is_used(*_args, **_kwargs):
@@ -393,8 +394,9 @@ def test_download_trajectory_omits_acp_credential_dir(client, monkeypatch, tmp_p
     (acp_dir / "auth.json").write_text('{"refresh_token": "rt-secret-123"}')
 
     monkeypatch.setattr(
-        "openhands.agent_server.file_router.get_default_config",
-        lambda: Config(session_api_keys=[], conversations_path=conversations_path),
+        client.app.state,
+        "config",
+        Config(session_api_keys=[], conversations_path=conversations_path),
     )
 
     response = client.get(f"/api/file/download-trajectory/{conversation_id}")
@@ -471,8 +473,9 @@ def test_download_trajectory_redacts_llm_and_condenser_secrets(
     (events_dir / "event-00000.json").write_text(json.dumps(event))
 
     monkeypatch.setattr(
-        "openhands.agent_server.file_router.get_default_config",
-        lambda: Config(session_api_keys=[], conversations_path=conversations_path),
+        client.app.state,
+        "config",
+        Config(session_api_keys=[], conversations_path=conversations_path),
     )
 
     response = client.get(f"/api/file/download-trajectory/{conversation_id}")
@@ -499,7 +502,7 @@ def test_download_trajectory_redacts_llm_and_condenser_secrets(
     assert meta_out["agent"]["llm"]["model"] == "gpt-4o"
 
 
-def _trajectory_dir(monkeypatch, tmp_path):
+def _trajectory_dir(client, monkeypatch, tmp_path):
     """Create a conversation directory served by download-trajectory."""
     conversations_path = tmp_path / "conversations"
     conversation_id = uuid4()
@@ -508,8 +511,9 @@ def _trajectory_dir(monkeypatch, tmp_path):
     (conversation_dir / "base_state.json").write_text('{"v": 1}')
     (conversation_dir / "events" / "event-00000.json").write_text('{"id": "e0"}')
     monkeypatch.setattr(
-        "openhands.agent_server.file_router.get_default_config",
-        lambda: Config(session_api_keys=[], conversations_path=conversations_path),
+        client.app.state,
+        "config",
+        Config(session_api_keys=[], conversations_path=conversations_path),
     )
     return conversation_id, conversation_dir
 
@@ -538,7 +542,7 @@ def test_download_trajectory_redacts_json_and_jsonl_files_only(
 
     Other files are archived byte for byte, even when they hold JSON.
     """
-    conversation_id, conversation_dir = _trajectory_dir(monkeypatch, tmp_path)
+    conversation_id, conversation_dir = _trajectory_dir(client, monkeypatch, tmp_path)
     line = json.dumps({"llm": {"api_key": "sk-plaintext-main-0123456789"}})
     jsonl_names = ("events.jsonl", "MORE.JSONL")
     for name in jsonl_names:
@@ -570,7 +574,7 @@ def test_download_trajectory_survives_state_save_during_zip(
     client, monkeypatch, tmp_path
 ):
     """An atomic base-state save that lands mid-zip must not cause a 500."""
-    conversation_id, conversation_dir = _trajectory_dir(monkeypatch, tmp_path)
+    conversation_id, conversation_dir = _trajectory_dir(client, monkeypatch, tmp_path)
     temp_file = conversation_dir / ".base_state.json.4867ztqe.tmp"
     temp_file.write_text('{"v": 2}')
 
@@ -594,7 +598,7 @@ def test_download_trajectory_skips_entries_removed_while_zipping(
     client, monkeypatch, tmp_path
 ):
     """Files and directories removed after listing are left out, not a 500."""
-    conversation_id, conversation_dir = _trajectory_dir(monkeypatch, tmp_path)
+    conversation_id, conversation_dir = _trajectory_dir(client, monkeypatch, tmp_path)
     (conversation_dir / "gone.txt").write_text("gone")
     (conversation_dir / "gone_dir").mkdir()
     (conversation_dir / "gone_dir" / "inner.json").write_text("{}")
@@ -623,7 +627,7 @@ def test_download_trajectory_omits_tmp_files(client, monkeypatch, tmp_path):
     ``owner_lease.tmp``. They may be half-written, and their names do not end
     in ``.json``, so they would also bypass secret redaction.
     """
-    conversation_id, conversation_dir = _trajectory_dir(monkeypatch, tmp_path)
+    conversation_id, conversation_dir = _trajectory_dir(client, monkeypatch, tmp_path)
     secret = "sk-in-progress-save-0123456789"
     (conversation_dir / ".base_state.json.4867ztqe.tmp").write_text(
         '{"agent": {"llm": {"api_key": "' + secret + '"'
@@ -652,7 +656,7 @@ def test_download_trajectory_keeps_dotfiles_that_are_not_tmp_files(
     client, monkeypatch, tmp_path
 ):
     """Only ``*.tmp`` files are left out; other dotfiles are archived."""
-    conversation_id, conversation_dir = _trajectory_dir(monkeypatch, tmp_path)
+    conversation_id, conversation_dir = _trajectory_dir(client, monkeypatch, tmp_path)
     kept = [".env.template", ".cache.metadata", "events/.eventlog-len-1.marker"]
     for name in kept:
         (conversation_dir / name).write_text(name)
@@ -674,7 +678,7 @@ def test_download_trajectory_archives_the_json_bytes_it_checked_for_secrets(
     afterwards by a version holding a Fernet token. The archive must contain
     the content that was read, not the newer file.
     """
-    conversation_id, conversation_dir = _trajectory_dir(monkeypatch, tmp_path)
+    conversation_id, conversation_dir = _trajectory_dir(client, monkeypatch, tmp_path)
     base_state = conversation_dir / "base_state.json"
     first_save = b'{"secret_registry": {"secret_sources": {}}}'
     base_state.write_bytes(first_save)
