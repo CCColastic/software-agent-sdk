@@ -4,7 +4,7 @@ import json
 import tempfile
 from pathlib import Path
 
-from openhands.agent_server.hooks_service import load_hooks_from_workspace
+from openhands.agent_server.hooks_service import load_hooks, load_hooks_from_workspace
 
 
 class TestLoadHooksFromWorkspace:
@@ -142,3 +142,93 @@ class TestLoadHooksFromWorkspace:
             assert not result.is_empty()
             assert len(result.stop) == 1
             assert len(result.pre_tool_use) == 1
+
+
+def _write_hooks(path: Path, command: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "stop": [
+                    {"matcher": "*", "hooks": [{"type": "command", "command": command}]}
+                ]
+            }
+        )
+    )
+
+
+class TestLoadHooks:
+    """Tests for load_hooks, which merges project and user hooks."""
+
+    def test_merges_project_then_user(self, tmp_path, monkeypatch):
+        user_dir = tmp_path / "user"
+        monkeypatch.setenv("OH_PERSISTENCE_DIR", str(user_dir))
+        project = tmp_path / "project"
+        _write_hooks(project / ".openhands" / "hooks.json", "echo project")
+        _write_hooks(user_dir / "hooks.json", "echo user")
+
+        result = load_hooks(project_dir=str(project))
+
+        assert result is not None
+        assert [m.hooks[0].command for m in result.stop] == [
+            "echo project",
+            "echo user",
+        ]
+
+    def test_user_hooks_without_project_dir(self, tmp_path, monkeypatch):
+        user_dir = tmp_path / "user"
+        monkeypatch.setenv("OH_PERSISTENCE_DIR", str(user_dir))
+        _write_hooks(user_dir / "hooks.json", "echo user")
+
+        result = load_hooks(project_dir=None)
+
+        assert result is not None
+        assert result.stop[0].hooks[0].command == "echo user"
+
+    def test_flags_select_sources(self, tmp_path, monkeypatch):
+        user_dir = tmp_path / "user"
+        monkeypatch.setenv("OH_PERSISTENCE_DIR", str(user_dir))
+        project = tmp_path / "project"
+        _write_hooks(project / ".openhands" / "hooks.json", "echo project")
+        _write_hooks(user_dir / "hooks.json", "echo user")
+
+        only_project = load_hooks(project_dir=str(project), load_user=False)
+        only_user = load_hooks(project_dir=str(project), load_project=False)
+
+        assert only_project is not None and only_user is not None
+        assert [m.hooks[0].command for m in only_project.stop] == ["echo project"]
+        assert [m.hooks[0].command for m in only_user.stop] == ["echo user"]
+        assert (
+            load_hooks(project_dir=str(project), load_project=False, load_user=False)
+            is None
+        )
+
+    def test_project_dir_that_is_home_reads_file_once(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        monkeypatch.setenv("OH_PERSISTENCE_DIR", str(home / ".openhands"))
+        _write_hooks(home / ".openhands" / "hooks.json", "echo once")
+
+        result = load_hooks(project_dir=str(home))
+
+        assert result is not None
+        assert len(result.stop) == 1
+
+    def test_invalid_user_file_keeps_project_hooks(self, tmp_path, monkeypatch):
+        user_dir = tmp_path / "user"
+        monkeypatch.setenv("OH_PERSISTENCE_DIR", str(user_dir))
+        project = tmp_path / "project"
+        _write_hooks(project / ".openhands" / "hooks.json", "echo project")
+        user_dir.mkdir()
+        (user_dir / "hooks.json").write_text("{not json")
+
+        result = load_hooks(project_dir=str(project))
+
+        assert result is not None
+        assert [m.hooks[0].command for m in result.stop] == ["echo project"]
+
+    def test_workspace_loader_ignores_user_hooks(self, tmp_path, monkeypatch):
+        user_dir = tmp_path / "user"
+        monkeypatch.setenv("OH_PERSISTENCE_DIR", str(user_dir))
+        _write_hooks(user_dir / "hooks.json", "echo user")
+
+        assert load_hooks_from_workspace(project_dir=str(tmp_path)) is None

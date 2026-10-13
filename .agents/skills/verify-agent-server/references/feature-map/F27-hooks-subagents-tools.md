@@ -1,8 +1,9 @@
 # Hooks, sub-agents and tool catalogs
 
 Read-only discovery routes a client calls before it configures or starts an
-agent. `POST /api/hooks` reads a workspace's `.openhands/hooks.json` and
-returns it as a normalized `HookConfig` (or `null`), which the client then
+agent. `POST /api/hooks` reads a workspace's `.openhands/hooks.json` and the
+user's `~/.openhands/hooks.json` and returns them merged as a normalized
+`HookConfig` (or `null`), which the client then
 passes as `hook_config` when it creates a conversation; only then do the hooks
 run and emit `HookExecutionEvent`s. `POST /api/sub-agents` lists the delegate
 agents a workspace offers (project, user and built-in Markdown definitions,
@@ -60,9 +61,11 @@ Routes: `GET /api/tools/`, `GET /api/tools/catalog`, `POST /api/sub-agents`,
 ## How to get to it (agent POV)
 
 - REST, hooks: `POST /api/hooks` with `{"project_dir": "<abs path>"}`
-  (`HooksRequest`) returns `{"hook_config": HookConfig | null}`. Only
-  `<project_dir>/.openhands/hooks.json` is read. Driven by the `F27.hooks-*`
-  bullets.
+  (`HooksRequest`) returns `{"hook_config": HookConfig | null}`: the
+  handlers of `<project_dir>/.openhands/hooks.json`, then those of the user
+  hooks file (`$OH_PERSISTENCE_DIR/hooks.json`, else `~/.openhands/hooks.json`).
+  `load_project` and `load_user` (both default `true`) pick the sources.
+  Driven by the `F27.hooks-*` bullets, which run with no user hooks file.
 - REST, conversations (second view, owned by the conversation family):
   `StartConversationRequest.hook_config` carries the returned config into
   `POST /api/conversations`; `GET /api/conversations/{id}` echoes

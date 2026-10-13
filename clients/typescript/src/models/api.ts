@@ -495,6 +495,10 @@ export interface FileSearchSubdirsOptions {
 
 export interface HooksRequest {
   project_dir?: string | null;
+  /** Read `<project_dir>/.openhands/hooks.json` (default true). */
+  load_project?: boolean;
+  /** Read the user's `~/.openhands/hooks.json` (default true). */
+  load_user?: boolean;
 }
 
 export interface HooksResponse {
