@@ -58,7 +58,7 @@ Routes: `GET /api/profiles`, `GET /api/profiles/{name}`,
 - `F20.delete-guarded`: deleting a profile that an agent profile references is 409 naming the referrer, and the profile stays.
 - `F20.delete`: `DELETE /api/profiles/{name}` removes the file and the list entry and clears `active_profile` in both views, leaves the applied `agent_settings.llm` in place, and answers 200 again for a name that is already gone.
 - `F20.json-alias-guard`: a name with a `.json` suffix addresses the same profile (`GET /api/profiles/<name>.json` reads `<name>`), and deleting through that alias is refused with 409 while an agent profile references `<name>`, as it is for the plain name.
-- `F20.secret-key-rotation`: after the server's secret key changes, activating a profile whose stored key can no longer be decrypted is refused instead of silently applying a keyless LLM.
+- `F20.secret-key-rotation`: after the server's secret key changes, activating or re-saving a profile whose stored key can no longer be decrypted is refused (409) instead of silently applying a keyless LLM or overwriting the key.
 
 ## How to get to it (agent POV)
 
@@ -912,8 +912,8 @@ Preconditions:
   without moving `active_profile` or the agent profile's `llm_profile_ref`.
   The bullet removes the agent profile and the (possibly already deleted)
   profile, and checks the list no longer has it, before it fails.
-- **Secret key rotation (`F20.secret-key-rotation`), known bug.** Save a
-  profile, restart with a new secret key, then activate it.
+- **Secret key rotation (`F20.secret-key-rotation`).** Save a
+  profile, restart with a new secret key, then activate and re-save it.
   ```sh
   control-agent-server api POST /api/profiles/qa-rotate --json '{"llm": {"model": "openai/qa-rotate", "api_key": "sk-qa-f20-rotate"}}' --expect 201
   control-agent-server api GET /api/profiles/qa-rotate --header 'X-Expose-Secrets: plaintext' --expect 200 --check config.api_key eq sk-qa-f20-rotate
@@ -922,27 +922,33 @@ Preconditions:
   control-agent-server state cat home/.openhands/profiles/qa-rotate.json --check api_key matches '^gAAAAA'
   control-agent-server api GET /api/profiles/qa-rotate --header 'X-Expose-Secrets: plaintext' --expect 2xx,4xx --save F20.secret-key-rotation/detail
   control-agent-server api GET /api/profiles --expect 2xx,4xx --save F20.secret-key-rotation/list
-  control-agent-server api POST /api/profiles/qa-rotate/activate --expect 4xx --save F20.secret-key-rotation/activate  # bug: status eq 200 && response.body.message contains 'activated and applied'
+  control-agent-server api POST /api/profiles/qa-rotate/activate --expect 409 --check detail eq "Profile 'qa-rotate' is encrypted with a different key" --save F20.secret-key-rotation/activate
+  control-agent-server api POST /api/profiles/qa-rotate --json '{"llm": {"model": "openai/qa-rotate"}}' --expect 409 --check detail eq "Profile 'qa-rotate' is encrypted with a different key" --save F20.secret-key-rotation/resave
+  control-agent-server state cat home/.openhands/profiles/qa-rotate.json --check api_key matches '^gAAAAA'
   control-agent-server api GET /api/settings --max-chars 200 --check active_profile eq deepseek-flash
   control-agent-server state cat home/.openhands/settings.json --max-chars 200 --check agent_settings.llm.api_key matches '^gAAAAA'
   ```
   Before the restart the key reads back and `deepseek-flash` is active with
-  a key (positive control). Expected the activation to be refused (4xx)
-  while the stored key cannot be decrypted, leaving `deepseek-flash` active
-  and the settings' old ciphertext in place. Today the file still holds the
-  old token, `GET` by name says `api_key_set: false` with a `null` key while
-  the list still says `api_key_set: true`, and the activation marked
-  `# bug` answers 200 `activated and applied to current settings` after
-  writing an LLM with `api_key: null` over the settings' stored key
-  (`llm_api_key_is_set` becomes `false`), so the next conversation fails at
-  the provider. The cipher returns `None`
-  for a token it cannot decrypt instead of raising
-  (`openhands-sdk/openhands/sdk/utils/cipher.py`), and the profile store
-  loads that silently. The same happens without `OH_SECRET_KEY` when only
-  the session key rotates, because the first session key is then the cipher
-  (checked on a `launch --no-secret-key` run: after `restart --rotate-key`
-  a plaintext read returns `null` and `api_key_set: false`). Run last: every
-  stored secret of this run is now unreadable.
+  a key (positive control). After it the stored key cannot be decrypted:
+  the profile file still holds the old token, `GET` by name says
+  `api_key_set: false` with a `null` key (reads stay lenient), and the list
+  still says `api_key_set: true` (see Gotchas). Activation is refused with
+  409 `Profile 'qa-rotate' is encrypted with a different key` before
+  anything is written, instead of applying an LLM with `api_key: null` over
+  the settings' stored key, so `deepseek-flash` stays active and the
+  settings keep their old ciphertext. Saving the keyless config read back
+  under the new key is refused the same way and the profile keeps its old
+  token, so restoring the original key recovers it; deleting the profile
+  and saving it again with a new key is the way forward under the new key.
+  The profile store loads with strict decryption on activation
+  (`LLMProfileStore.load(..., strict=True)` in
+  `openhands-sdk/openhands/sdk/llm/llm_profile_store.py`) and refuses to
+  overwrite a profile holding a token the cipher cannot decrypt. The same
+  applies without `OH_SECRET_KEY` when only the session key rotates,
+  because the first session key is then the cipher (after
+  `restart --rotate-key` a plaintext read returns `null` and
+  `api_key_set: false`). Run last: every stored secret of this run is now
+  unreadable.
 
 ## Gotchas
 
@@ -993,7 +999,7 @@ Preconditions:
   profile through the alias.
 - `launch` sets `OH_SECRET_KEY`. `--no-secret-key` alone still leaves a
   cipher, derived from the first session key (and `restart --rotate-key` then
-  loses every stored key, as in `F20.secret-key-rotation`); only
+  leaves every stored key undecryptable, as in `F20.secret-key-rotation`); only
   `--no-auth --no-secret-key` gives a server without a cipher
   (`F20.no-cipher`).
 - 5xx answers from these routes (503 store busy, 503 encryption not
