@@ -818,7 +818,7 @@ Preconditions:
   says `400 if name format is invalid` while every one answers 422
   (`F18.secret-name-validation`); clients generated from the OpenAPI
   document inherit the wrong promise.
-- **Cipher key rotation (`F18.secret-key-rotation`), known bug.** Store a
+- **Cipher key rotation (`F18.secret-key-rotation`).** Store a
   secret and an LLM key; rotate the cipher key and rotate back with no write
   in between (the control); then rotate again, write something unrelated
   under the new key, and rotate back.
@@ -840,25 +840,23 @@ Preconditions:
   control-agent-server api GET /api/settings/secrets/QA_F18_TOKEN --expect 200 --check . eq "$QA_F18_SECRET" --save F18.secret-key-rotation/control-rotated-back
   control-agent-server api GET /api/settings --header 'X-Expose-Secrets: plaintext' --check agent_settings.llm.api_key eq "$QA_F18_LLM_KEY"
   control-agent-server restart --rotate-secret-key
-  control-agent-server api PUT /api/settings/secrets --json '{"name": "QA_F18_ROTATED", "value": "qa-f18-rotated-value"}' --expect 200,409,500 --save F18.secret-key-rotation/put-under-new-key
-  control-agent-server api PATCH /api/settings --json '{"misc_settings_diff": {"qa_f18_rotated": true}}' --expect 200,409 --save F18.secret-key-rotation/patch-under-new-key
+  control-agent-server api PUT /api/settings/secrets --json '{"name": "QA_F18_ROTATED", "value": "qa-f18-rotated-value"}' --expect 500 --save F18.secret-key-rotation/put-under-new-key
+  control-agent-server api PATCH /api/settings --json '{"misc_settings_diff": {"qa_f18_rotated": true}}' --expect 409 --check detail contains 'encrypted with a different key' --save F18.secret-key-rotation/patch-under-new-key
   control-agent-server restart --restore-secret-key
-  control-agent-server state cat home/.openhands/secrets.json --check custom_secrets.QA_F18_TOKEN.secret matches '^gAAAAA'  # bug: content.custom_secrets.QA_F18_TOKEN exists && content.custom_secrets.QA_F18_TOKEN.secret eq null
-  control-agent-server state cat home/.openhands/settings.json --check agent_settings.llm.api_key matches '^gAAAAA'  # bug: content.agent_settings.llm exists && content.agent_settings.llm.api_key eq null
-  control-agent-server api GET /api/settings/secrets/QA_F18_TOKEN --expect 200 --check . eq "$QA_F18_SECRET" --save F18.secret-key-rotation/after-rotating-back  # bug: status eq 404 && response.body.detail eq 'Secret not found'
-  control-agent-server api GET /api/settings --header 'X-Expose-Secrets: plaintext' --check agent_settings.llm.api_key eq "$QA_F18_LLM_KEY" --save F18.secret-key-rotation/settings-after-rotating-back  # bug: status eq 200 && checks.0.actual eq null
+  control-agent-server state cat home/.openhands/secrets.json --check custom_secrets.QA_F18_TOKEN.secret matches '^gAAAAA'
+  control-agent-server state cat home/.openhands/settings.json --check agent_settings.llm.api_key matches '^gAAAAA'
+  control-agent-server api GET /api/settings/secrets/QA_F18_TOKEN --expect 200 --check . eq "$QA_F18_SECRET" --save F18.secret-key-rotation/after-rotating-back
+  control-agent-server api GET /api/settings --header 'X-Expose-Secrets: plaintext' --check agent_settings.llm.api_key eq "$QA_F18_LLM_KEY" --save F18.secret-key-rotation/settings-after-rotating-back
   ```
   Under the new key every read degrades silently: the secret is 404 `Secret
   not found`, `llm_api_key_is_set` is `false`, and the log says `Failed to
   decrypt secret value`; rotating straight back reads both values again (the
-  control). Expected: a write under the new key either refuses (the store's
-  own "encrypted with a different key" protection: 409 for settings, 500 for
-  secrets) or leaves the old ciphertext alone, so the original key still
-  reads the values. Today the PUT of an unrelated secret and the misc PATCH
-  both answer 200 and rewrite `QA_F18_TOKEN.secret` and `llm.api_key` as
-  `null` on disk, so after rotating back both are gone for good. The run is
-  back on its original key before the first `# bug` line; the trap stores
-  both values again and deletes `QA_F18_ROTATED`.
+  control). A write under the new key refuses with the store's own
+  "encrypted with a different key" protection (409 for the settings PATCH,
+  500 for the secrets PUT, #5622) and leaves both files untouched, so after
+  rotating back the original key reads `QA_F18_TOKEN.secret` and
+  `llm.api_key` again. The trap stores both values again and deletes
+  `QA_F18_ROTATED` in case a write went through.
 
 ## Gotchas
 

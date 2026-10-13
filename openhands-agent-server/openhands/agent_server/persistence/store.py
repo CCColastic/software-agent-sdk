@@ -34,6 +34,10 @@ from openhands.sdk.logger import get_logger
 from openhands.sdk.profiles.agent_profile_store import AgentProfileStore
 from openhands.sdk.utils.cipher import Cipher
 from openhands.sdk.utils.path import get_user_persistence_dir
+from openhands.sdk.utils.pydantic_secrets import (
+    STRICT_DECRYPT_CONTEXT_KEY,
+    SecretDecryptionError,
+)
 
 
 # fcntl is Unix-only; on Windows, use msvcrt for file locking
@@ -241,6 +245,13 @@ def _atomic_write_json(path: Path, data: dict) -> None:
 DEFAULT_PERSISTENCE_DIR = Path("workspace/.openhands")
 
 
+def _load_context(cipher: Cipher | None, strict: bool) -> dict[str, Any] | None:
+    """Validation context for loading a store file with ``cipher``."""
+    if cipher is None:
+        return None
+    return {"cipher": cipher, STRICT_DECRYPT_CONTEXT_KEY: strict}
+
+
 class SettingsStore(ABC):
     """Abstract base class for settings storage."""
 
@@ -317,12 +328,16 @@ class FileSettingsStore(SettingsStore):
         self._path = self.persistence_dir / filename
         self._lock_path = self.persistence_dir / ".settings.lock"
 
-    def load(self) -> PersistedSettings | None:
+    def load(self, *, strict: bool = False) -> PersistedSettings | None:
         """Load settings from file.
 
         If a cipher is provided, secrets are decrypted via Pydantic's
         validation context. The cipher is passed to model_validate which
         flows through to field validators using validate_secret().
+
+        A secret the cipher cannot decrypt loads as ``None``. With
+        ``strict=True`` (read-modify-write paths) the load fails instead,
+        returning ``None``, so the caller refuses to overwrite the file.
         """
         if not self._path.exists():
             logger.debug(f"Settings file not found: {self._path}")
@@ -334,8 +349,11 @@ class FileSettingsStore(SettingsStore):
 
             # Pass cipher in context for automatic decryption of all secret fields
             # This flows through to field validators using validate_secret()
-            context = {"cipher": self.cipher} if self.cipher else None
+            context = _load_context(self.cipher, strict)
             return PersistedSettings.from_persisted(data, context=context)
+        except SecretDecryptionError as e:
+            logger.error(f"Cannot load settings for update: {e}")
+            return None
         except (PermissionError, OSError) as e:
             # Critical filesystem errors should be re-raised
             logger.error(f"Cannot access settings file: {e}")
@@ -406,7 +424,7 @@ class FileSettingsStore(SettingsStore):
                 data loss from overwriting existing settings with defaults.
         """
         with _file_lock(self._lock_path):
-            settings = self.load()
+            settings = self.load(strict=True)
             if settings is None:
                 # File doesn't exist or is empty - safe to use defaults
                 if self._path.exists():
@@ -463,12 +481,16 @@ class FileSecretsStore(SecretsStore):
                 "for secure storage."
             )
 
-    def load(self) -> Secrets | None:
+    def load(self, *, strict: bool = False) -> Secrets | None:
         """Load secrets from file.
 
         If a cipher is provided, secrets are decrypted via Pydantic's
         validation context. The cipher is passed to model_validate which
         flows through to field validators using validate_secret().
+
+        A secret the cipher cannot decrypt loads as ``None``. With
+        ``strict=True`` (read-modify-write paths) the load fails instead,
+        returning ``None``, so the caller refuses to overwrite the file.
         """
         if not self._path.exists():
             logger.debug(f"Secrets file not found: {self._path}")
@@ -479,8 +501,11 @@ class FileSecretsStore(SecretsStore):
                 data = json.load(f)
 
             # Pass cipher in context for automatic decryption of all secret fields
-            context = {"cipher": self.cipher} if self.cipher else None
+            context = _load_context(self.cipher, strict)
             return Secrets.model_validate(data, context=context)
+        except SecretDecryptionError as e:
+            logger.error(f"Cannot load secrets for update: {e}")
+            return None
         except (PermissionError, OSError) as e:
             # Critical filesystem errors should be re-raised
             logger.error(f"Cannot access secrets file: {e}")
@@ -497,7 +522,7 @@ class FileSecretsStore(SecretsStore):
     def save(self, secrets: Secrets) -> None:
         """Save secrets while preserving credential generations."""
         with _file_lock(self._lock_path):
-            current = self.load()
+            current = self.load(strict=True)
             if current is None:
                 if self._path.exists():
                     raise RuntimeError(
@@ -595,7 +620,7 @@ class FileSecretsStore(SecretsStore):
                 data loss from overwriting existing secrets with defaults.
         """
         with _file_lock(self._lock_path):
-            secrets = self.load()
+            secrets = self.load(strict=True)
             if secrets is None:
                 # File doesn't exist - safe to use defaults
                 if self._path.exists():
@@ -629,7 +654,7 @@ class FileSecretsStore(SecretsStore):
                 data loss from overwriting existing secrets with defaults.
         """
         with _file_lock(self._lock_path):
-            secrets = self.load()
+            secrets = self.load(strict=True)
             if secrets is None:
                 # File doesn't exist - nothing to delete
                 if self._path.exists():
@@ -651,7 +676,7 @@ class FileSecretsStore(SecretsStore):
 
     def load_versioned_secret(self, name: str) -> tuple[str, str]:
         with _file_lock(self._lock_path):
-            secrets = self.load()
+            secrets = self.load(strict=True)
             if secrets is None:
                 if self._path.exists():
                     raise RuntimeError(
@@ -679,7 +704,7 @@ class FileSecretsStore(SecretsStore):
         value: str,
     ) -> str:
         with _file_lock(self._lock_path):
-            secrets = self.load()
+            secrets = self.load(strict=True)
             if secrets is None:
                 if self._path.exists():
                     raise RuntimeError(

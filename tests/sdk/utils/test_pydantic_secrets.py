@@ -9,6 +9,8 @@ from pydantic import SecretStr
 from openhands.sdk.utils.cipher import FERNET_TOKEN_PREFIX, Cipher
 from openhands.sdk.utils.pydantic_secrets import (
     REDACTED_SECRET_VALUE,
+    STRICT_DECRYPT_CONTEXT_KEY,
+    SecretDecryptionError,
     decrypt_str_with_cipher_or_keep,
     is_redacted_secret,
     serialize_secret,
@@ -499,3 +501,37 @@ def test_validate_secret_dict_passes_through_non_dict(cipher, mock_info):
     # rather than turning it into a TypeError here.
     assert validate_secret_dict("not-a-dict", info, description="x") == "not-a-dict"
     assert validate_secret_dict(None, info, description="x") is None
+
+
+# ── strict decryption (read-modify-write paths) ─────────────────────────
+
+
+def test_validate_secret_strict_raises_on_wrong_cipher(mock_info, cipher):
+    token = cipher.encrypt(SecretStr("sk-test-123"))
+    wrong = Cipher("another-key")
+    lenient = mock_info({"cipher": wrong})
+    strict = mock_info({"cipher": wrong, STRICT_DECRYPT_CONTEXT_KEY: True})
+
+    assert validate_secret(token, lenient) is None
+    with pytest.raises(SecretDecryptionError) as exc_info:
+        validate_secret(token, strict)
+    assert FERNET_TOKEN_PREFIX not in str(exc_info.value)
+
+
+def test_validate_secret_dict_strict_raises_on_wrong_cipher(mock_info, cipher):
+    token = cipher.encrypt(SecretStr("env-value"))
+    wrong = Cipher("another-key")
+    value = {"API_TOKEN": token, "PLAIN": "kept"}
+    lenient = mock_info({"cipher": wrong})
+    strict = mock_info({"cipher": wrong, STRICT_DECRYPT_CONTEXT_KEY: True})
+
+    assert validate_secret_dict(value, lenient) == value
+    with pytest.raises(SecretDecryptionError) as exc_info:
+        validate_secret_dict(value, strict, description="MCP env")
+    assert FERNET_TOKEN_PREFIX not in str(exc_info.value)
+    # The matching cipher still decrypts in strict mode.
+    ok = mock_info({"cipher": cipher, STRICT_DECRYPT_CONTEXT_KEY: True})
+    assert validate_secret_dict(value, ok) == {
+        "API_TOKEN": "env-value",
+        "PLAIN": "kept",
+    }
