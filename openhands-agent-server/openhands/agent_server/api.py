@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sys
 import tempfile
 import traceback
 import uuid
@@ -17,6 +18,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.requests import Request
 
+from openhands.agent_server.acp_router import acp_router
 from openhands.agent_server.agent_profiles_router import agent_profiles_router
 from openhands.agent_server.auth_router import auth_router
 from openhands.agent_server.bash_router import bash_router
@@ -112,27 +114,57 @@ from openhands.tools.terminal.constants import (
     TMUX_SOCKET_NAME,
     TMUX_SOCKET_OWNER_OPTION,
 )
+from openhands.tools.terminal.terminal.tmux_terminal import _socket_creation_lock
 
 
 logger = get_logger(__name__)
 
 
+# tmux binds $TMUX_TMPDIR/tmux-<uid>/<socket name>, and fails with "File name
+# too long" when that does not fit sockaddr_un.sun_path (108 bytes on Linux,
+# 104 on macOS and the BSDs, NUL included).
+_MAX_TMUX_SOCKET_PATH = 107 if sys.platform.startswith("linux") else 103
+_MAX_TMUX_SOCKET_NAME = len(f"{TMUX_SOCKET_NAME}-{uuid.uuid4().hex}")
+_SHORT_TMUX_TMPDIR_ROOT = Path("/tmp")
+
+
+def _fits_tmux_socket(tmux_tmpdir: Path) -> bool:
+    if os.name != "posix":
+        return True
+    socket_dir = Path(os.path.realpath(tmux_tmpdir)) / f"tmux-{os.getuid()}"
+    socket_path_len = len(os.fsencode(socket_dir)) + 1 + _MAX_TMUX_SOCKET_NAME
+    return socket_path_len <= _MAX_TMUX_SOCKET_PATH
+
+
 def _default_server_tmux_tmpdir() -> Path:
-    return Path(tempfile.gettempdir()) / f"openhands-agent-server-{os.getpid()}"
+    name = f"openhands-agent-server-{os.getpid()}"
+    tmux_tmpdir = Path(tempfile.gettempdir()) / name
+    if _fits_tmux_socket(tmux_tmpdir):
+        return tmux_tmpdir
+    # macOS's per-user $TMPDIR (/var/folders/...) is too deep for a socket.
+    return _SHORT_TMUX_TMPDIR_ROOT / name
 
 
 def _ensure_server_tmux_tmpdir() -> tuple[Path, bool]:
     existing = os.getenv("TMUX_TMPDIR")
-    if existing:
+    if existing and _fits_tmux_socket(Path(existing)):
         return Path(existing), False
 
     tmux_tmpdir = _default_server_tmux_tmpdir()
     tmux_tmpdir.mkdir(parents=True, exist_ok=True)
     os.environ["TMUX_TMPDIR"] = str(tmux_tmpdir)
-    logger.info(
-        "TMUX_TMPDIR not set; defaulting to per-server tmux directory %s",
-        tmux_tmpdir,
-    )
+    if existing:
+        logger.warning(
+            "TMUX_TMPDIR %s is too long for tmux socket paths; "
+            "using per-server tmux directory %s instead",
+            existing,
+            tmux_tmpdir,
+        )
+    else:
+        logger.info(
+            "TMUX_TMPDIR not set; defaulting to per-server tmux directory %s",
+            tmux_tmpdir,
+        )
     return tmux_tmpdir, True
 
 
@@ -169,19 +201,8 @@ def _socket_owner_pid(server: libtmux.Server) -> int | None:
         return None
 
 
-def _cleanup_stale_tmux_sessions() -> None:
-    """Clean up legacy and isolated terminal sockets on server startup.
-
-    The legacy socket (``openhands``) is always reclaimed. Per-instance
-    sockets (``openhands-<32 hex>``) are only reclaimed when their owning
-    process is gone: several agent-servers may share one externally supplied
-    ``TMUX_TMPDIR``, and killing a live sibling's sessions silently destroys
-    that conversation's terminal.
-    """
-    if os.name != "posix":
-        return
-    socket_dir = Path(os.environ.get("TMUX_TMPDIR", "/tmp")) / f"tmux-{os.getuid()}"
-
+def _reclaim_stale_tmux_sockets(socket_dir: Path) -> None:
+    """Reclaim the legacy socket and any isolated socket whose owner is gone."""
     try:
         _kill_sessions(libtmux.Server(socket_name=TMUX_SOCKET_NAME))
     except Exception as e:
@@ -203,8 +224,36 @@ def _cleanup_stale_tmux_sessions() -> None:
             logger.warning("Failed to cleanup tmux socket %s: %s", socket_name, e)
 
 
+def _cleanup_stale_tmux_sessions() -> None:
+    """Clean up legacy and isolated terminal sockets on server startup.
+
+    The legacy socket (``openhands``) is always reclaimed. Per-instance
+    sockets (``openhands-<32 hex>``) are only reclaimed when their owning
+    process is gone: several agent-servers may share one externally supplied
+    ``TMUX_TMPDIR``, and killing a live sibling's sessions silently destroys
+    that conversation's terminal.
+
+    The scan holds the same cross-process creation lock that terminal setup
+    takes between creating a socket and recording its owner, so a socket that
+    is still being set up by a live process is never reclaimed as stale.
+    """
+    if os.name != "posix":
+        return
+    socket_dir = Path(os.environ.get("TMUX_TMPDIR", "/tmp")) / f"tmux-{os.getuid()}"
+
+    try:
+        with _socket_creation_lock():
+            _reclaim_stale_tmux_sockets(socket_dir)
+    except Exception as e:
+        # The lock only closes a rare startup race; it must never stop cleanup
+        # from running (or the server from starting).
+        logger.warning("tmux socket creation lock unavailable: %s", e)
+        _reclaim_stale_tmux_sockets(socket_dir)
+
+
 @asynccontextmanager
 async def api_lifespan(api: FastAPI) -> AsyncIterator[None]:
+    original_tmux_tmpdir = os.environ.get("TMUX_TMPDIR")
     tmux_tmpdir, tmux_tmpdir_was_defaulted = _ensure_server_tmux_tmpdir()
     secret_resolution: local_secret_resolution | None = None
     try:
@@ -367,7 +416,10 @@ async def api_lifespan(api: FastAPI) -> AsyncIterator[None]:
         if tmux_tmpdir_was_defaulted and os.environ.get("TMUX_TMPDIR") == str(
             tmux_tmpdir
         ):
-            os.environ.pop("TMUX_TMPDIR", None)
+            if original_tmux_tmpdir is None:
+                os.environ.pop("TMUX_TMPDIR", None)
+            else:
+                os.environ["TMUX_TMPDIR"] = original_tmux_tmpdir
 
 
 def _emit_request_failed(request: Request, exc: Exception, error_id: str) -> None:
@@ -485,10 +537,10 @@ def _add_api_routes(app: FastAPI) -> None:
     # check_session_api_key reads config from request.app.state at request time,
     # so keys delivered via POST /api/init are honoured without re-registering routes.
     dependencies = [
-        Depends(check_session_api_key),
         # Dormant gate: 503s every /api/* route until POST /api/init completes.
         # No-op for non-deferred deployments.
         Depends(require_initialized),
+        Depends(check_session_api_key),
     ]
 
     api_router = APIRouter(prefix="/api", dependencies=dependencies)
@@ -510,6 +562,7 @@ def _add_api_routes(app: FastAPI) -> None:
     api_router.include_router(canvas_extensions_router)
     api_router.include_router(hooks_router)
     api_router.include_router(llm_router)
+    api_router.include_router(acp_router)
     api_router.include_router(provider_connections_router)
     api_router.include_router(mcp_router)
     api_router.include_router(settings_router)
@@ -520,7 +573,10 @@ def _add_api_routes(app: FastAPI) -> None:
     # /api/auth/* mints workspace cookies and requires the header to bootstrap,
     # so it lives under the header-only auth group.
     api_router.include_router(auth_router)
-    app.include_router(openai_router, dependencies=[Depends(check_openai_api_key)])
+    app.include_router(
+        openai_router,
+        dependencies=[Depends(require_initialized), Depends(check_openai_api_key)],
+    )
 
     # Workspace static-file routes get their own auth group that accepts
     # EITHER the X-Session-API-Key header OR the workspace session cookie.
@@ -528,14 +584,21 @@ def _add_api_routes(app: FastAPI) -> None:
     # workspace artifacts work — browsers cannot attach custom headers to
     # those requests.
     workspace_api_router = APIRouter(
-        prefix="/api", dependencies=[Depends(check_workspace_session)]
+        prefix="/api",
+        dependencies=[Depends(require_initialized), Depends(check_workspace_session)],
     )
     workspace_api_router.include_router(conversation_registry.workspace_router)
     app.include_router(workspace_api_router)
     app.include_router(api_router)
 
-    app.include_router(app_backend_bridge_router)
-    app.include_router(conversation_registry.sockets_router)
+    app.include_router(
+        app_backend_bridge_router,
+        dependencies=[Depends(require_initialized)],
+    )
+    app.include_router(
+        conversation_registry.sockets_router,
+        dependencies=[Depends(require_initialized)],
+    )
 
 
 def _setup_static_files(app: FastAPI, config: Config) -> None:
