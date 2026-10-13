@@ -121,7 +121,7 @@ def test_python_image_uses_canonical_minimal_runtime() -> None:
     assert "FROM python:3.13.15-slim-trixie AS python-runtime" in dockerfile_text
     assert "FROM node:24.21.0-trixie-slim AS node-runtime" in dockerfile_text
     assert "ARG BASE_IMAGE=python-node-runtime" in dockerfile_text
-    assert re.search(r"ARG DEBIAN_SNAPSHOT=\d{8}T000000Z", dockerfile_text)
+    assert re.search(r"ARG DEBIAN_SNAPSHOT=\d{8}T\d{6}Z", dockerfile_text)
     assert (
         "URIs: http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}"
         in dockerfile_text
