@@ -663,3 +663,33 @@ async def test_resend_mode_takes_precedence_over_resend_all(
     # No deprecation warning since we're using the new API
     warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
     assert not any("resend_all is deprecated" in w for w in warning_calls)
+
+
+@pytest.mark.asyncio
+async def test_websocket_subscriber_close_closes_socket(mock_websocket):
+    """PubSub.close() (delete, pause) must close the socket, not leave it silent."""
+    subscriber = _WebSocketSubscriber(websocket=mock_websocket)
+
+    await subscriber.close()
+
+    mock_websocket.close.assert_awaited_once_with(
+        code=1012, reason="Conversation closed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_websocket_subscriber_close_is_bounded_for_stalled_peer(
+    mock_websocket, monkeypatch
+):
+    """A peer that stopped reading cannot hold up the delete or the pause."""
+    import asyncio
+
+    monkeypatch.setattr(
+        "openhands.agent_server.sockets.SUBSCRIBER_CLOSE_TIMEOUT_SECONDS", 0.05
+    )
+    mock_websocket.close.side_effect = lambda **_: asyncio.Event().wait()
+    subscriber = _WebSocketSubscriber(websocket=mock_websocket)
+
+    await asyncio.wait_for(subscriber.close(), timeout=2)
+
+    mock_websocket.close.assert_awaited_once()

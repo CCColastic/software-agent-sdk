@@ -39,6 +39,10 @@ class _FakeWebSocket:
     def __init__(self) -> None:
         self.sent: list[str] = []
         self.gate: asyncio.Event | None = None
+        self.closed_with: tuple[int, str] | None = None
+
+    async def close(self, code: int = 1000, reason: str | None = None) -> None:
+        self.closed_with = (code, reason or "")
 
     async def send_text(self, payload: str) -> None:
         if self.gate is not None:
@@ -393,3 +397,45 @@ async def test_a_dropped_progress_frame_does_not_drop_the_connection():
     )
     await _drain(writer)
     assert writer.closed
+
+
+@pytest.mark.asyncio
+async def test_subscriber_close_closes_socket_and_ends_inbound_loop():
+    """PubSub.close() (delete, pause) must close the socket, not leave it silent."""
+    ws, log = _FakeWebSocket(), _FakeEventLog()
+    writer = _ConnectionWriter(ws)  # type: ignore[arg-type]
+    writer.start()
+    sub = _SessionSubscriber(writer=writer, events=log)  # type: ignore[arg-type]
+    sub.go_live(None)
+
+    await sub.close()
+
+    assert ws.closed_with == (1012, "Conversation closed")
+    # The handler's inbound loop races this event; it must now be set.
+    assert writer.closed_event.is_set()
+    assert writer.drop_reason == "closing"
+
+
+@pytest.mark.asyncio
+async def test_subscriber_close_is_bounded_for_stalled_peer(monkeypatch):
+    """A peer that stopped reading cannot hold up the delete or the pause."""
+    monkeypatch.setattr(
+        "openhands.agent_server.sockets.SUBSCRIBER_CLOSE_TIMEOUT_SECONDS", 0.05
+    )
+    ws, log = _FakeWebSocket(), _FakeEventLog()
+    ws.gate = asyncio.Event()  # never set: the writer is stuck mid-send
+
+    async def hang(code: int = 1000, reason: str | None = None) -> None:
+        await asyncio.Event().wait()
+
+    ws.close = hang  # type: ignore[method-assign]
+    writer = _ConnectionWriter(ws)  # type: ignore[arg-type]
+    writer.start()
+    sub = _SessionSubscriber(writer=writer, events=log)  # type: ignore[arg-type]
+    sub.go_live(None)
+    await sub(_msg("stuck"))
+    await _drain(writer)
+
+    await asyncio.wait_for(sub.close(), timeout=2)
+
+    assert writer.closed_event.is_set()

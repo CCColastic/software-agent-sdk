@@ -302,6 +302,75 @@ def test_prepare_for_sandbox_pause_drains_conversations(server_env):
     assert conversation_id in server_env["conversation_service"]._conversation_records
 
 
+def _start_idle_conversation(client: httpx.Client) -> str:
+    agent = Agent(llm=LLM(model="gpt-4o-mini", api_key=SecretStr("test")), tools=[])
+    payload = {
+        "agent": agent.model_dump(mode="json", context={"expose_secrets": True}),
+        "workspace": {"working_dir": "/tmp/workspace/project"},
+    }
+    start = client.post("/api/conversations", json=payload, timeout=10.0)
+    start.raise_for_status()
+    return start.json()["id"]
+
+
+def _assert_closed_by_server(websocket) -> int:
+    """Read until the server's close frame; fail if the socket stays open."""
+    with pytest.raises(ConnectionClosed) as closed:
+        while True:
+            websocket.recv(timeout=10)
+    assert closed.value.rcvd is not None, "socket closed without a server frame"
+    return closed.value.rcvd.code
+
+
+@pytest.mark.parametrize("socket_kind", ["events", "session"])
+def test_delete_closes_open_conversation_sockets(server_env, socket_kind):
+    """Deleting a conversation closes the sockets attached to it (#5635)."""
+    ws_host = server_env["host"].replace("http://", "ws://")
+    with httpx.Client(base_url=server_env["host"]) as client:
+        conversation_id = _start_idle_conversation(client)
+        with connect(f"{ws_host}/sockets/{socket_kind}/{conversation_id}") as ws:
+            ws.recv(timeout=10)  # subscribed: snapshot (events) or sync (session)
+
+            response = client.delete(f"/api/conversations/{conversation_id}")
+            assert response.status_code == 200
+
+            code = _assert_closed_by_server(ws)
+        assert client.get(f"/api/conversations/{conversation_id}").status_code == 404
+
+    assert code == 1012
+    with connect(f"{ws_host}/sockets/{socket_kind}/{conversation_id}") as ws:
+        assert _assert_closed_by_server(ws) == 4004
+
+
+@pytest.mark.parametrize("socket_kind", ["events", "session"])
+def test_sandbox_pause_closes_open_conversation_sockets(server_env, socket_kind):
+    """A pause closes pre-pause sockets so clients reconnect (#5635)."""
+    ws_host = server_env["host"].replace("http://", "ws://")
+    with httpx.Client(base_url=server_env["host"]) as client:
+        conversation_id = _start_idle_conversation(client)
+        socket_url = f"{ws_host}/sockets/{socket_kind}/{conversation_id}"
+        with connect(socket_url) as before:
+            before.recv(timeout=10)
+
+            response = client.post(
+                "/api/conversations/prepare-for-sandbox-pause", timeout=10.0
+            )
+            assert response.status_code == 204
+
+            assert _assert_closed_by_server(before) == 1012
+
+        # The conversation is resumable: a reconnecting client streams again.
+        with connect(socket_url) as after:
+            after.recv(timeout=10)
+            sent = client.post(
+                f"/api/conversations/{conversation_id}/events",
+                json={"content": [{"type": "text", "text": "after-pause"}]},
+            )
+            assert sent.status_code == 200
+            while "after-pause" not in str(after.recv(timeout=10)):
+                pass
+
+
 @pytest.fixture
 def server_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Generator[dict]:
     with live_server_env(tmp_path, monkeypatch) as env:

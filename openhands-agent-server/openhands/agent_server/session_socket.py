@@ -36,6 +36,7 @@ from openhands.agent_server.session_protocol import (
 )
 from openhands.agent_server.sockets import (
     _accept_authenticated_websocket,
+    _close_subscribed_websocket,
     _get_conversation_service,
     _is_auth_control_message,
     _is_websocket_connected,
@@ -192,6 +193,12 @@ class _SessionSubscriber(Subscriber[Event]):
             self._buffer.append(event)
             return
         self._emit(event)
+
+    async def close(self) -> None:
+        # Close first so the close code is the first thing the client sees; the
+        # writer then stops, which also ends the handler's inbound loop.
+        await _close_subscribed_websocket(self.writer.websocket)
+        await self.writer.aclose()
 
     def _emit(self, event: Event) -> None:
         seq = self._seq_of(event)

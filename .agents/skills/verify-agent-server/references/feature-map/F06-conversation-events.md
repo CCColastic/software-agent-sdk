@@ -407,7 +407,7 @@ Preconditions:
   wrong query or header key is refused before the upgrade with HTTP 403, so
   that client sees no close code. A valid key on an unknown conversation
   authenticates, then closes with 4004 `Conversation not found`.
-- **Deleting a conversation closes its sockets (`F06.ws-delete-close`), known bug.**
+- **Deleting a conversation closes its sockets (`F06.ws-delete-close`).**
   A background capture is subscribed (its `full_state` snapshot arrived and
   it is open) before the DELETE; the DELETE, a 404 on REST and a 4004 for a
   new socket all succeed before the open capture is judged.
@@ -419,17 +419,13 @@ Preconditions:
   control-agent-server api DELETE "/api/conversations/$QA_DEL" --expect 200 --save F06.ws-delete-close/delete
   control-agent-server api GET "/api/conversations/$QA_DEL" --expect 404
   control-agent-server ws listen "/sockets/events/$QA_DEL" --expect-close 4004 --duration 5
-  control-agent-server ws stop f06-del --save F06.ws-delete-close/socket | control-agent-server assert --check close.code exists  # bug: value.opened eq true && value.stopped eq stopped && value.close missing
+  control-agent-server ws stop f06-del --save F06.ws-delete-close/socket | control-agent-server assert --check close.code eq 1012
   ```
-  Correct behavior: the server closes the open socket (with any close code)
-  while it deletes the conversation; `EventService.close()` awaits
-  `PubSub.close()` before the DELETE answers, so the close has arrived by the
-  time the capture is stopped. Today the capture is still open with no close
-  frame (`close: null`), although REST answers 404 and a new socket gets
-  4004: `PubSub.close()` calls `Subscriber.close()`, which
-  `_WebSocketSubscriber` does not implement (`pub_sub.py`, `sockets.py`), so
-  an SDK or TypeScript client keeps waiting on a conversation that no longer
-  exists.
+  The server closes the open socket with 1012 while it deletes the
+  conversation: `EventService.close()` awaits `PubSub.close()`, which closes
+  each `_WebSocketSubscriber`'s socket, before the DELETE answers, so the
+  close has arrived by the time the capture is stopped. 1012 asks the client
+  to reconnect; the reconnect gets 4004, which the SDK treats as final.
 - **Replay everything (`F06.ws-replay-all`).**
   ```sh
   IDS=$(control-agent-server api GET "/api/conversations/$CID/events/search" --field items | jq -c '[.[].id]')
@@ -724,9 +720,10 @@ Preconditions:
   after the upgrade; a wrong deprecated query or header key is refused before
   the upgrade (HTTP 403, no close code), which the SDK does not treat as
   fatal.
-- Deleting a conversation does not close its open sockets
-  (`F06.ws-delete-close`); they stay open with no further frames, while a
-  new connection gets 4004.
+- Deleting a conversation, pausing the sandbox or shutting the server down
+  closes the conversation's open sockets with 1012 (`F06.ws-delete-close`);
+  a new connection after a delete gets 4004. A peer that stopped reading
+  delays the DELETE by at most 5 s.
 - `StreamingDeltaEvent` frames reach this socket only when the agent's LLM
   has `stream: true`; they are never persisted, so search never returns them.
 - A per-field `execution_status=finished` frame is a hint, not the end of
