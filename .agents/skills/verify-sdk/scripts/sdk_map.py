@@ -55,10 +55,16 @@ PRODUCT_PATH_RE = re.compile(r"^openhands-(sdk|tools|workspace)/")
 # Commands that need a model key: example scripts, the examples test runner
 # and the integration runner. Deterministic pytest under tests/integration/
 # (test_tool_presets.py and friends) is not one of them.
+# Commands that need a real model: example scripts, the integration runner,
+# and control-sdk runs or exec calls that use the run's model.
 MODEL_COMMAND_RE = re.compile(
     r"(?:^|[\s'\"=])(?:tests/)?examples/|tests/integration/run_infer\.py"
+    r"|control-sdk\s+new\b.*--llm[ =](?!scripted)|--model-env\b"
 )
 INTEGRATION_RE = re.compile(r"tests/integration/run_infer\.py")
+EXAMPLE_RE = re.compile(r"(?:^|[\s'\"=])(?:tests/)?examples/")
+MODEL_KEY_ENVS = ("DEEPSEEK_API_KEY", "LLM_API_KEY")
+BLOCKED_EXIT = 3
 BASELINE_LINE_RE = re.compile(
     r"^Maintenance baseline: main@([0-9a-f]{7,40}) \((\d{4}-\d{2}-\d{2})\)(.*)$",
     re.M,
@@ -250,6 +256,59 @@ def check_family(path: Path) -> list[str]:
     for row in ids:
         if row["id"] not in driven:
             problems.append(f"{row['id']} has no `Driving it` bullet")
+    for n, bullet in enumerate(bullets(path), 1):
+        for block in bullet["blocks"]:
+            for statement in split_statements(block):
+                problems += [f"bullet {n}: {p}" for p in recipe_problems(statement)]
+    return problems
+
+
+CONTROL_SDK_RE = re.compile(r"\bcontrol-sdk\s+([^|;&)`\n]*)")
+
+
+def recipe_problems(statement: str) -> list[str]:
+    """Recipes drive the SDK; every control-sdk call must parse and resolve."""
+    problems = []
+    if re.search(r"\bpytest\b", statement):
+        problems.append(
+            "runs pytest; recipes drive the SDK like a program does"
+            " (unit tests belong on `Unit:` lines)"
+        )
+    for match in CONTROL_SDK_RE.finditer(re.sub(r"\\\n\s*", " ", statement)):
+        try:
+            tokens = shlex.split(match.group(1))
+        except ValueError as exc:
+            problems.append(f"cannot split `control-sdk {match.group(1)}`: {exc}")
+            continue
+        problems += control_sdk_problems(tokens)
+    return problems
+
+
+def control_sdk_problems(tokens: list[str]) -> list[str]:
+    sys.path.insert(0, str(SKILL_DIR / "scripts"))
+    import control_sdk
+
+    shown = "control-sdk " + " ".join(tokens)
+    try:
+        import contextlib
+        import io
+
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            args = control_sdk.build_parser().parse_args(
+                control_sdk.normalize_argv(tokens)
+            )
+    except SystemExit:
+        return [f"`{shown}` does not parse: {err.getvalue().strip()[-200:]}"]
+    problems = []
+    name = getattr(args, "name", None)
+    if args.command == "program" and name:
+        program = control_sdk.PROGRAMS_DIR / (name if name.endswith(".py") else f"{name}.py")
+        if not program.is_file():
+            problems.append(f"`{shown}`: no program {program.relative_to(SKILL_DIR)}")
+    script = getattr(args, "script", None)
+    if script and "$" not in script:
+        if not (control_sdk.PROGRAMS_DIR / script).is_file() and not Path(script).is_file():
+            problems.append(f"`{shown}`: no script programs/{script}")
     return problems
 
 
@@ -488,10 +547,12 @@ def needs_model(statement: str) -> bool:
 
 
 def proof_kind(statement: str) -> str:
-    """deterministic (no model), example, or integration (the runner)."""
+    """scripted (no model), live (a real model), example, or integration."""
     if INTEGRATION_RE.search(statement):
         return "integration"
-    return "example" if needs_model(statement) else "deterministic"
+    if EXAMPLE_RE.search(statement):
+        return "example"
+    return "live" if needs_model(statement) else "scripted"
 
 
 def kill_group(pgid: int) -> None:
@@ -510,11 +571,19 @@ def kill_group(pgid: int) -> None:
             time.sleep(0.1)
 
 
-def run_script(script: str, log: Any, timeout: float) -> int:
+def run_script(
+    script: str, log: Any, timeout: float, home: Path | None = None
+) -> int:
     """Run a script in its own process group; nothing it starts outlives it."""
+    env = {k: v for k, v in os.environ.items() if k != "SDK_VERIFY_RUN"}
+    env["PATH"] = os.pathsep.join([str(SKILL_DIR / "scripts"), env.get("PATH", "")])
+    if home is not None:
+        # Each bullet gets its own control-sdk runs, so "the newest run" is its own.
+        env["SDK_VERIFY_HOME"] = str(home)
     proc = subprocess.Popen(
         ["bash", "-eo", "pipefail", "-c", script],
         cwd=REPO_ROOT,
+        env=env,
         stdin=subprocess.DEVNULL,
         stdout=log,
         stderr=subprocess.STDOUT,
@@ -587,10 +656,12 @@ def run_bullet(
     ran = 0
     for b, block in enumerate(bullet["blocks"], 1):
         kept, checks = [], []
-        for k, statement in enumerate(split_statements(block), 1):
-            if needs_model(statement) and not with_llm:
-                result["skipped_model"] += 1
-                continue
+        statements = split_statements(block)
+        if not with_llm and any(needs_model(st) for st in statements):
+            # A block shares one control-sdk run; half of it proves nothing.
+            result["skipped_model"] += 1
+            continue
+        for k, statement in enumerate(statements, 1):
             if INTEGRATION_RE.search(statement):
                 out_dir = work / f"block{b}-{k}"
                 statement = with_output_dir(statement, out_dir)
@@ -604,9 +675,12 @@ def run_bullet(
         log.flush()
         start_offset = log.tell()
         started = time.monotonic()
-        code = run_script(script, log, timeout)
+        code = run_script(script, log, timeout, home=work / f"block{b}")
         log.write(f"\n[exit {code} after {time.monotonic() - started:.0f}s]\n")
         log.flush()
+        if code == BLOCKED_EXIT:
+            worse("blocked", f"block {b} is blocked (exit 3: a missing prerequisite)")
+            break
         if code != 0:
             worse(
                 "fail",
@@ -614,7 +688,7 @@ def run_bullet(
             )
             break
         result["proof"].update(proof_kind(st) for st in kept)
-        if any(proof_kind(st) == "example" for st in kept):
+        if any(proof_kind(st) in ("example", "live") for st in kept):
             output = Path(log.name).read_text(errors="replace")[start_offset:]
             if re.search(r"^EXAMPLE_COST: 0(?:\.0+)?\s*$", output, re.M):
                 result["notes"].append(
@@ -629,7 +703,7 @@ def run_bullet(
     if result["skipped_model"]:
         skipped = result["skipped_model"]
         result["notes"].append(
-            f"{skipped} model-backed command(s) skipped (no LLM_API_KEY)"
+            f"{skipped} model-backed block(s) skipped (no DEEPSEEK_API_KEY)"
         )
     if ran == 0 and result["outcome"] == "pass":
         result["outcome"] = "blocked"
@@ -644,7 +718,7 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
     known = {row["id"] for row in collect_ids()}
     if only and only - known:
         usage_error(f"unknown IDs: {sorted(only - known)}", f"{CLI} ids --file S05")
-    with_llm = args.with_llm or bool(os.environ.get("LLM_API_KEY"))
+    with_llm = args.with_llm or any(os.environ.get(k) for k in MODEL_KEY_ENVS)
     out = None if args.dry_run else run_dir(args.out)
     revision = git("rev-parse", "HEAD") or "unknown"
     summary: list[dict[str, Any]] = []
@@ -946,21 +1020,21 @@ def build_parser() -> argparse.ArgumentParser:
   {CLI} run --file S01 --dry-run
 
 Each bullet's ```sh blocks run in Bash with `set -eo pipefail` from the
-repository root, stdin closed, each block in its own process group that is
-killed when the block ends or times out. A bullet passes when every block it
-ran exits 0. Commands that run examples/ scripts, tests/examples/ or the
-integration runner (tests/integration/run_infer.py) need a model: they run
-when LLM_API_KEY is set (or --with-llm) and are skipped otherwise, while the
-deterministic commands in the same block still run; a bullet with nothing
-left to run is `blocked`. Integration runs get a fresh --output-dir and pass
-only when every requested test is present and successful in its
-results.json (the runner exits 0 on failed tests). Each ledger row's `proof`
-says which kinds passed: deterministic, example, integration. An example that
-prints `EXAMPLE_COST: 0` gets a note, since some examples run partly without
-a model. A bullet whose label says
-"blocked" is reported and not executed. Rows go to <out>/ledger.jsonl and
-transcripts to <out>/transcripts/; <out> defaults to a new directory under
-${HOME_ENV} (or $TMPDIR/sdk-verify).""",
+repository root, stdin closed, with control-sdk on PATH and a private
+SDK_VERIFY_HOME per block, each block in its own process group that is killed
+when the block ends or times out. A bullet passes when every block it ran
+exits 0; exit 3 (control-sdk's "blocked") makes it `blocked`. A block that
+needs a real model (`control-sdk new --llm deepseek-...`, `--model-env`, an
+examples/ script or tests/integration/run_infer.py) runs only when
+DEEPSEEK_API_KEY or LLM_API_KEY is set (or --with-llm) and is skipped whole
+otherwise; a bullet with nothing left to run is `blocked`. Integration runs
+get a fresh --output-dir and pass only when every requested test is present
+and successful in its results.json (the runner exits 0 on failed tests).
+Each ledger row's `proof` says which kinds passed: scripted (the real SDK
+with a scripted model), live (a real model), example, integration. A bullet
+whose label says "blocked" is reported and not executed. Rows go to
+<out>/ledger.jsonl and transcripts to <out>/transcripts/; <out> defaults to a
+new directory under ${HOME_ENV} (or $TMPDIR/sdk-verify).""",
     )
     p.set_defaults(func=cmd_run)
     p.add_argument("--file")

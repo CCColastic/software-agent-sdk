@@ -4,7 +4,7 @@ Everything a conversation does is an immutable `Event` (a frozen, `extra="forbid
 
 Source: `openhands-sdk/openhands/sdk/event/`, `openhands-sdk/openhands/sdk/conversation/event_store.py`, `openhands-sdk/openhands/sdk/conversation/events_list_base.py`, `openhands-sdk/openhands/sdk/conversation/persistence_const.py`, `openhands-sdk/openhands/sdk/conversation/state.py`, `openhands-sdk/openhands/sdk/utils/models.py`
 
-Needs: `llm`, `tmux`
+Needs: `tmux`; live bullets need `DEEPSEEK_API_KEY`
 
 Examples: `examples/01_standalone_sdk/36_event_json_to_openai_messages.py`
 
@@ -44,36 +44,95 @@ Examples: `examples/01_standalone_sdk/36_event_json_to_openai_messages.py`
 ## Driving it
 
 Preconditions:
-- `uv sync --dev` has run.
-- For the example: `LLM_API_KEY` and `LLM_MODEL` exported; `tmux` on `PATH` (the example uses `TerminalTool`).
+- `uv sync --dev` has run; `control-sdk` is on `PATH` (`export PATH="$PWD/.agents/skills/verify-sdk/scripts:$PATH"`). `sdk-map run` does both.
+- `tmux` on `PATH` (the conversations use `TerminalTool`).
+- Live bullets: `DEEPSEEK_API_KEY` exported.
 
-- **Event model and JSON round trip (`S05.event-base`, `S05.json-roundtrip`, `S05.error-classification`, `S05.streaming-delta`, `S05.completion-log-event`).**
+- **A conversation's events, saved and reloaded (`S05.event-base`, `S05.json-roundtrip`, `S05.to-llm-message`, `S05.events-to-messages`, `S05.openai-format`, `S05.unmatched-actions`, `S05.event-log-files`, `S05.event-cache`, `S05.event-tree`, `S05.visualize`, `S05.resume-transcript`).** A scripted agent writes a file with the terminal, reads it back with two parallel tool calls from one LLM response, and finishes; a program then reloads the saved event files the way a user's program would.
   ```sh
-  uv run pytest tests/sdk/event/test_event_immutability.py tests/sdk/event/test_event_serialization.py tests/sdk/utils/test_discriminated_union.py -q
-  uv run pytest tests/sdk/event/test_error_classification.py tests/sdk/event/test_streaming.py tests/sdk/event/test_llm_completion_log_event.py -q
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  CID=$(control-sdk conversation new --script S05/write_and_read.json --field id)
+  control-sdk conversation send "$CID" --text "Write notes.txt with two lines, then read it back" --run \
+    --check execution_status eq finished --check last_agent_message eq "notes.txt has two lines"
+  control-sdk conversation events "$CID" --kind ActionEvent --check count eq 4
+  control-sdk program S05/reload_events --arg "$CID" \
+    --check event_files eq 10 --check file_names_ok eq true --check roundtrip_equal eq true \
+    --check reopened_same_log eq true --check path_to_root eq 10 --check iteration_cached eq true \
+    --check frozen eq true --check extra_forbidden eq true --check root_id_rejected eq true \
+    --check action_events eq 4 --check assistant_messages_with_tool_calls eq 3 \
+    --check chat_roles.0 eq system --check responses_instructions eq true \
+    --check responses_item_types contains function_call_output \
+    --check unmatched_actions eq 0 --check transcript_mentions_command eq true
   ```
-  All pass.
-- **Events to LLM messages and OpenAI payloads (`S05.to-llm-message`, `S05.events-to-messages`, `S05.system-prompt-blocks`, `S05.openai-format`).** Unit proof, then the example with a real model.
+  Ten event files named `event-NNNNN-<id>.json`, each restoring to an equal event of the same kind; four actions from three LLM responses fold into three assistant messages with tool calls; the Chat Completions payload starts with the system message and the Responses payload carries `instructions` and `function_call_output` items; nothing is left unmatched.
+- **Control-flow and telemetry events (`S05.error-classification`, `S05.streaming-delta`, `S05.completion-log-event`).** A scripted authentication failure ends the run with a classified `ConversationErrorEvent`; the other event types round-trip.
   ```sh
-  uv run pytest tests/sdk/event/test_events_to_messages.py tests/sdk/event/test_non_executable_action_event.py tests/sdk/event/test_dynamic_context_message_sequence.py tests/sdk/llm/test_responses_serialization.py -q
-  uv run python examples/01_standalone_sdk/36_event_json_to_openai_messages.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  CID=$(control-sdk conversation new --script-json '[{"error": "LLMAuthenticationError", "message": "invalid api key"}]' --field id)
+  control-sdk conversation send "$CID" --text hi --run --allow-error --check execution_status eq error
+  control-sdk conversation events "$CID" --kind ConversationErrorEvent \
+    --check count eq 1 --check events.0.code eq LLMAuthenticationError --check events.0.failure_kind eq auth
+  control-sdk program S05/event_types \
+    --check roundtrip.conversation_error eq true --check roundtrip.agent_error eq true \
+    --check roundtrip.streaming_delta eq true --check roundtrip.completion_log eq true \
+    --check auth_kind eq auth --check rate_limit_kind eq rate_limit --check code_beats_detail eq internal \
+    --check secret_in_classification eq false
+  ```
+- **Concurrent appends (`S05.event-log-append`).** Four threads append 40 events to a finished conversation's log, as two parts of one program would.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  CID=$(control-sdk conversation new --script S05/write_and_read.json --field id)
+  control-sdk conversation send "$CID" --text "Write notes.txt" --run --check execution_status eq finished
+  control-sdk program S05/event_log --arg "$CID" \
+    --check appended eq 40 --check indexes_consecutive eq true --check duplicate_rejected eq true \
+    --check negative_index_ok eq true --check lookup_ok eq true --check events eq 50
+  ```
+- **A damaged log (`S05.event-log-recovery`).** One saved event file of a finished conversation is corrupted (then, on a fresh run, deleted) and the conversation is reopened, as a program finds it after a crash or a bad copy.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  CID=$(control-sdk conversation new --script S05/write_and_read.json --field id)
+  control-sdk conversation send "$CID" --text "Write notes.txt" --run --check execution_status eq finished
+  control-sdk program S05/damaged_log --arg "$CID" --arg corrupt \
+    --check reopen_error missing --check lost_beyond_damaged eq 0
+  ```
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  CID=$(control-sdk conversation new --script S05/write_and_read.json --field id)
+  control-sdk conversation send "$CID" --text "Write notes.txt" --run --check execution_status eq finished
+  control-sdk program S05/damaged_log --arg "$CID" --arg delete \
+    --check reopen_error missing --check lost_beyond_damaged eq 0
+  ```
+  Expected: the conversation reopens with every readable event. Known failure (reproduced 2026-10-13, not yet filed): reopening fails. A corrupted file raises a pydantic `ValidationError` ("Invalid JSON"); a deleted one logs "Event index gap detected" and raises `KeyError: Unknown event_id` from `EventLog.get_index`. The unit tests cover an `EventLog` read in isolation, not a conversation resumed over it.
+- **The same, live (`S05.json-roundtrip`, `S05.events-to-messages`, `S05.openai-format`).** A real model does the task its own way; the reload must hold for whatever it produced.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  CID=$(control-sdk conversation new --field id)
+  control-sdk conversation send "$CID" --run \
+    --text "Create notes.txt containing the lines alpha and beta using the terminal, show it with cat, then finish." \
+    --check execution_status eq finished
+  control-sdk exec --expect-output alpha --expect-output beta -- cat notes.txt
+  control-sdk program S05/reload_events --arg "$CID" \
+    --check roundtrip_equal eq true --check reopened_same_log eq true --check unmatched_actions eq 0 \
+    --check responses_item_types contains function_call
+  ```
+- **Example 36 (`S05.json-roundtrip`, `S05.openai-format`).** Live.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk exec --model-env --expect-output "messages" -- python examples/01_standalone_sdk/36_event_json_to_openai_messages.py
   ```
   The example runs two turns with persistence, reloads every `events/event-*.json`, and logs either `Chat Completions messages:` or `Responses input:` with the formatted JSON.
-- **API compliance of produced histories (`S05.events-to-messages`).** **Blocked** without a model key.
+- **API compliance of produced histories (`S05.events-to-messages`).** Live, through the integration runner.
   ```sh
-  uv run python tests/integration/run_infer.py --llm-config '{"model": "'"$LLM_MODEL"'"}' --eval-ids a01_unmatched_tool_use
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk exec --model-env -- python tests/integration/run_infer.py --llm-config '{"model": "deepseek/deepseek-flash"}' --eval-ids a01_unmatched_tool_use
   ```
-- **Event log, files, recovery, cache and tree (`S05.event-log-*`, `S05.event-cache`, `S05.event-tree`, `S05.unmatched-actions`).**
+- **System prompt blocks (`S05.system-prompt-blocks`).** The saved `SystemPromptEvent` of a conversation with agent context turns into system content blocks, static first.
   ```sh
-  uv run pytest tests/sdk/conversation/test_event_store.py tests/sdk/conversation/test_event_tree.py tests/sdk/conversation/test_get_unmatched_actions.py -q
-  uv run pytest tests/sdk/conversation/local/test_state_serialization.py -q
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S05/system_prompt_blocks --check blocks_ge_2 eq true --check static_first eq true \
+    --check dynamic_has_suffix eq true --check static_has_suffix eq false
   ```
-  All pass; the 100k-event reload test takes a few seconds.
-- **Visualization and resume transcript (`S05.visualize`, `S05.resume-transcript`).**
-  ```sh
-  uv run pytest tests/sdk/event/test_action_event_summary.py tests/sdk/event/test_system_prompt_event_visualize.py tests/sdk/event/test_resume_transcript.py -q
-  ```
-- **TokenEvent (`S05.token-event`), untested.** Needs a vLLM endpoint that returns `prompt_token_ids`; no test or example exercises it.
+- **TokenEvent (`S05.token-event`), blocked.** Needs a vLLM endpoint that returns `prompt_token_ids`; no recipe reaches it.
 
 ## Gotchas
 
