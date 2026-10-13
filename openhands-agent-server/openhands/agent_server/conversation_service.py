@@ -2305,7 +2305,7 @@ class ConversationService:
                     AutoTitleSubscriber(service=event_service)
                 )
             await self._maybe_subscribe_telemetry(
-                event_service, stored, is_new_conversation=is_new_conversation
+                event_service, loaded, is_new_conversation=is_new_conversation
             )
             await asyncio.gather(
                 *[
