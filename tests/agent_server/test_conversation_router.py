@@ -1028,6 +1028,7 @@ def test_start_conversation_non_object_secret_is_422(
         response = client.post("/api/conversations", json=request)
 
         assert response.status_code == 422
+        assert response.json()["detail"][0]["loc"] == ["body", "secrets", "PLAIN"]
         mock_conversation_service.start_conversation.assert_not_called()
     finally:
         client.app.dependency_overrides.clear()
@@ -1051,6 +1052,7 @@ def test_update_secrets_non_string_value_is_422(
         )
 
         assert response.status_code == 422
+        assert response.json()["detail"][0]["loc"] == ["body", "secrets", "BAD"]
         mock_event_service.update_secrets.assert_not_called()
     finally:
         client.app.dependency_overrides.clear()

@@ -471,12 +471,12 @@ KID=$(control-agent-server api POST /api/conversations \
   ```sh
   control-agent-server api POST "/api/conversations/$KID/secrets" --json '{"secrets": {"QA_F08_STRING": "qa-f08-string-value"}}' --expect 200
   control-agent-server api POST "/api/conversations/$KID/secrets" --json '{"secrets": {"QA_F08_NUMBER": 5}}' \
-    --expect 422 --save F08.secrets-bad-value/number
+    --expect 422 --check detail.0.type eq model_attributes_type --save F08.secrets-bad-value/number
   control-agent-server api POST "/api/conversations/$KID/secrets" --json '{"secrets": {"QA_F08_NULL": null}}' --expect 422
   control-agent-server api POST "/api/conversations/$KID/secrets" --json '{"secrets": {"QA_F08_BOOL": true}}' --expect 422
   ```
-  Each is 422 (`model_type`: "Input should be a valid dictionary or instance
-  of SecretSource") like any other invalid body, never a 500.
+  Each is a standard 422 validation error (`model_attributes_type`) like any
+  other invalid body, never a 500.
   `UpdateSecretsRequest.convert_string_secrets` converts only strings
   and `{"value": ...}` dicts; other values reach `SecretSource` validation as is.
 - **Secrets in the terminal (`F08.secrets-terminal`).** The stub's command

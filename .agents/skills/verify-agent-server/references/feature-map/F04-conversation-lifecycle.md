@@ -410,10 +410,11 @@ EOF
   ```sh
   control-agent-server api POST /api/conversations \
     --json "{\"workspace\": {\"working_dir\": \"$W\"}, \"agent\": $OFFLINE_AGENT, \"autotitle\": false, \"secrets\": {\"QA_F04_PLAIN\": \"qa-f04-plain-value\"}}" \
-    --expect 422 --save F04.create-secrets-plain/start
+    --expect 422 --check detail.0.type eq model_attributes_type --check detail.0.loc.2 eq QA_F04_PLAIN \
+    --save F04.create-secrets-plain/start
   ```
-  The answer is 422 (`model_type`: "Input should be a valid dictionary or
-  instance of SecretSource"), never a 500.
+  The answer is a standard 422 validation error on
+  `secrets.QA_F04_PLAIN` (`model_attributes_type`), never a 500.
 - **A real run (`F04.run-real`).** DeepSeek flash answers a one-line prompt;
   autotitle is on.
   ```sh
