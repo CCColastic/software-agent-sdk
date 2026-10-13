@@ -129,7 +129,7 @@ RUN set -eux; \
 
 FROM debian:trixie-slim AS python-node-runtime
 ARG NPM_VERSION
-ARG DEBIAN_SNAPSHOT=20261013T000000Z
+ARG DEBIAN_SNAPSHOT=20261012T234422Z
 
 COPY --from=python-runtime /usr/local /usr/local
 COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
