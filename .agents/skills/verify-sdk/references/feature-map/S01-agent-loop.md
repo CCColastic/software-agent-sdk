@@ -28,7 +28,7 @@ Examples: `examples/01_standalone_sdk/01_hello_world.py`, `examples/01_standalon
 - `S01.image-non-vision`: images sent to a non-vision model produce an agent message saying the model cannot see images and the run finishes without an LLM call; if a vision profile tool is available the images are replaced by references the agent can inspect with that tool. Unit: `tests/sdk/agent/test_non_multimodal_image_input.py`. Example: none. Real-LLM: none.
 - `S01.ask-agent`: `conversation.ask_agent(question)` returns a direct LLM answer built from the current history, adds no events and leaves status unchanged, works while `run()` is in flight, drops unanswered tool calls from the context, and raises on context-window errors. Unit: `tests/sdk/conversation/test_ask_agent.py`. Example: `examples/01_standalone_sdk/28_ask_agent_example.py`. Real-LLM: none.
 - `S01.structured-output`: `Tool(name=..., params={"response_schema": Model})` extends that tool's action schema with the model's fields, validates the LLM's arguments against it, and `tool.parse_last_response(events)` returns the latest typed instance. Invalid schemas (object-level constraints, dynamic fields, field collisions, reserved names, toolsets) are rejected. Unit: `tests/sdk/tool/test_response_schema.py`. Example: `examples/01_standalone_sdk/56_structured_output.py`. Real-LLM: none.
-- `S01.malformed-tool-call`: malformed tool arguments are repaired when possible (control characters, stringified JSON); a call that still fails validation becomes a user `MessageEvent` with the validation error and the loop continues. Unit: `tests/sdk/agent/test_fix_malformed_tool_arguments.py`, `tests/sdk/agent/test_tool_validation_error_message.py`. Example: none. Real-LLM: none.
+- `S01.malformed-tool-call`: malformed tool arguments are repaired when possible (control characters, stringified JSON); a native tool call that still fails validation becomes an `AgentErrorEvent` naming the validation error (a malformed prompted-mode `<function=...>` reply becomes a user `MessageEvent` instead) and the loop continues. Unit: `tests/sdk/agent/test_fix_malformed_tool_arguments.py`, `tests/sdk/agent/test_tool_validation_error_message.py`. Example: none. Real-LLM: none.
 - `S01.unknown-tool`: a call to a tool the agent does not have yields an `AgentErrorEvent` the model sees, not a crash. Unit: `tests/sdk/agent/test_nonexistent_tool_handling.py`. Example: none. Real-LLM: none.
 - `S01.tool-exception`: an exception inside a tool executor becomes an `AgentErrorEvent` for that call and the conversation continues. Unit: `tests/sdk/agent/test_tool_execution_error_handling.py`. Example: none. Real-LLM: none.
 - `S01.content-policy`: an output blocked by the provider's content filter becomes a user nudge to rephrase, not a fatal error. Unit: `tests/sdk/agent/test_agent_content_policy_violation.py`. Example: none. Real-LLM: none.
@@ -49,71 +49,219 @@ Examples: `examples/01_standalone_sdk/01_hello_world.py`, `examples/01_standalon
 ## Driving it
 
 Preconditions:
-- `uv sync --dev` has run.
-- For example bullets: `LLM_API_KEY` exported, optionally `LLM_MODEL` (default `gpt-5.5`) and `LLM_BASE_URL`; `tmux` installed (the terminal tool); network access.
+- `uv sync --dev` has run; `control-sdk` is on `PATH` (`export PATH="$PWD/.agents/skills/verify-sdk/scripts:$PATH"`). `sdk-map run` does both.
+- `tmux` on `PATH` (the conversations use `TerminalTool`).
+- Live bullets: `DEEPSEEK_API_KEY` exported.
 
-- **Run loop and status transitions (`S01.run-to-finish`, `S01.max-iterations`, `S01.max-budget`, `S01.stuck-recover`).** Deterministic proof with a scripted LLM, then the hello-world example with a real model.
+Scripted bullets use the SDK's `TestLLM` (`--script`, or `make_llm(script=...)` in `programs/S01/loop.py`), so the real agent loop, real tools and real event log run with no key. Where cost or the wire format matters the program points a real `LLM` at `programs/S02/fake_provider.py`. `programs/S01/sleeper.py` is a small custom tool (waits, records when it ran, can declare resource keys or raise).
+
+- **Run to finish, and what a finished conversation does next (`S01.run-to-finish`, `S01.response-dispatch`).** A terminal call, then a plain text reply (content finishes the run); a second `run()` makes no LLM call; a new message moves FINISHED back to IDLE.
   ```sh
-  uv run pytest tests/sdk/conversation/local/test_agent_status_transition.py -q
-  uv run python examples/01_standalone_sdk/01_hello_world.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  CID=$(control-sdk conversation new --script S01/run_to_finish.json --field id)
+  control-sdk conversation send "$CID" --text "Write result.txt" --run \
+    --check execution_status eq finished --check last_agent_message eq "result.txt now says done."
+  control-sdk exec --expect-output done -- cat result.txt
+  control-sdk conversation run "$CID" --check execution_status eq finished --check script_left eq 0
+  control-sdk conversation send "$CID" --text "One more thing" --check execution_status eq idle
+  control-sdk program S01/loop --arg status \
+    --check initial eq idle --check observed contains running --check after_run eq finished \
+    --check rerun_llm_calls eq 0 --check after_rerun eq finished --check after_new_message eq idle
   ```
-  12 tests pass; the example writes `FACTS.txt` in the repo root and exits.
-- **Reply classification and nudges (`S01.response-dispatch`, `S01.empty-reply-nudge`).**
+- **Parallel tool calls are emitted together (`S01.response-dispatch`).** One LLM reply with two tool calls produces two consecutive `ActionEvent`s before their observations.
   ```sh
-  uv run pytest tests/sdk/agent/test_response_dispatch.py tests/sdk/agent/test_reasoning_only_responses.py tests/sdk/agent/test_tool_call_recovery.py -q
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  CID=$(control-sdk conversation new --script S01/echo_parallel_finish.json --field id)
+  control-sdk conversation send "$CID" --text "Write greeting.txt and check it" --run --check execution_status eq finished
+  control-sdk conversation events "$CID" --last 6 \
+    --check kinds.0 eq ActionEvent --check kinds.1 eq ActionEvent \
+    --check kinds.2 eq ObservationEvent --check kinds.3 eq ObservationEvent \
+    --check events.0.tool eq file_editor --check events.1.tool eq terminal
   ```
-  The tests pass: content finishes, reasoning-only and empty replies inject a nudge.
-- **Stuck detection (`S01.stuck-detect`, `S01.stuck-thresholds`, `S01.stuck-nudge`).**
+- **Recovering inside a step (`S01.empty-reply-nudge`, `S01.malformed-tool-call`, `S01.unknown-tool`, `S01.content-policy`).** One scripted run meets an unknown tool, arguments that fail validation, a stringified JSON list (repaired), a content-filter block and an empty reply, then finishes.
   ```sh
-  uv run pytest tests/cross/test_stuck_detector.py tests/cross/test_stuck_detector_config.py tests/sdk/conversation/local/test_stuck_detector_nudge.py -q
-  uv run python examples/01_standalone_sdk/20_stuck_detector.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  CID=$(control-sdk conversation new --script S01/step_errors.json --field id)
+  control-sdk conversation send "$CID" --text "Plan the work" --run \
+    --check execution_status eq finished --check last_agent_message eq "survived every error"
+  control-sdk conversation events "$CID" --kind AgentErrorEvent \
+    --check count eq 2 --check events.0.error contains "Tool 'no_such_tool' not found" \
+    --check events.1.error contains "Error validating tool 'terminal'"
+  control-sdk conversation events "$CID" --kind ObservationEvent \
+    --check events.0.tool eq task_tracker --check events.0.is_error eq false --check events.0.text contains "1 item"
+  control-sdk conversation events "$CID" --kind MessageEvent --source user \
+    --check events.1.text contains "blocked by the model's content filter"
+  control-sdk conversation events "$CID" --kind MessageEvent --source environment \
+    --check count eq 1 --check events.0.text contains "did not include a function call"
   ```
-  The tests pass; the example asks for five identical `ls` actions and prints `Final stuck status: True` if the model complies (a model that refuses to repeat itself prints `False`).
-- **Parallel tool execution (`S01.parallel-tools`, `S01.parallel-resource-locks`, `S01.finish-truncates-batch`).**
+- **A reasoning-only reply (`S01.empty-reply-nudge`).** A reply with `reasoning_content` and no text or tool call gets the same nudge.
   ```sh
-  uv run pytest tests/sdk/agent/test_parallel_execution_integration.py tests/sdk/agent/test_parallel_executor.py tests/sdk/agent/test_parallel_executor_locking.py tests/sdk/agent/test_action_batch.py -q
-  uv run python examples/01_standalone_sdk/45_parallel_tool_execution.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S01/loop --arg reasoning-only \
+    --check status eq finished --check llm_calls eq 2 --check nudges eq 1 --check nudge_text contains "did not include a function call"
   ```
-  The tests pass; the example prints a "Parallelism Report" listing, per agent, the batches whose tool calls ran in parallel.
-- **Messages during a run, async loop (`S01.message-while-running`, `S01.async-step`).**
+- **The iteration cap (`S01.max-iterations`).** `max_iteration_per_run=2` with three steps of work, and with the finish on step two.
   ```sh
-  uv run pytest tests/sdk/agent/test_message_during_streaming_arun.py tests/sdk/agent/test_message_while_finishing.py tests/sdk/agent/test_astep_releases_state_lock.py -q
-  uv run python examples/01_standalone_sdk/18_send_message_while_processing.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  CID=$(control-sdk conversation new --script S01/max_iterations.json --max-iterations 2 --field id)
+  control-sdk conversation send "$CID" --text "Echo three times" --run --allow-error \
+    --check execution_status eq error --check script_left eq 2
+  control-sdk conversation events "$CID" --kind ConversationErrorEvent --check count eq 1 --check events.0.code eq MaxIterationsReached
+  CID=$(control-sdk conversation new --script S01/finish_on_last.json --max-iterations 2 --field id)
+  control-sdk conversation send "$CID" --text "Echo once" --run --check execution_status eq finished
   ```
-  The tests pass; the example's `document.txt` has three lines, the third from a message sent while the agent was sleeping.
-- **Image input (`S01.image-input`, `S01.image-non-vision`).**
+- **The budget cap (`S01.max-budget`).** A priced model (0.14 per call) under `max_budget_per_run=0.2`, and a run that finishes on its first call over a 0.1 budget.
   ```sh
-  uv run pytest tests/sdk/llm/test_vision_support.py tests/sdk/llm/test_llm_image_resizing.py tests/sdk/agent/test_non_multimodal_image_input.py -q
-  uv run python examples/01_standalone_sdk/17_image_input.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S01/loop --arg budget \
+    --check over_budget.status eq error --check over_budget.codes.0 eq MaxBudgetReached \
+    --check over_budget.llm_calls eq 2 --check over_budget.cost eq 0.28 \
+    --check finish_over_budget.status eq finished --check finish_over_budget.codes len-eq 0 \
+    --check factory_accepts_budget eq true
   ```
-  The tests pass; the example describes the python.org icon, writes `image_report.md`, then lists 21 colours from downscaled images.
-- **Side questions (`S01.ask-agent`).**
+  Known failure (reproduced 2026-10-13, not yet filed): the budget logic works on `LocalConversation(..., max_budget_per_run=...)`, but the public `Conversation(...)` factory does not take the argument this family documents: `TypeError: Conversation.__new__() got an unexpected keyword argument 'max_budget_per_run'` (`factory_accepts_budget` is `false`). A program has to import `LocalConversation` from `openhands.sdk.conversation.impl.local_conversation` to set a budget.
+- **Stuck on a repeating action (`S01.stuck-detect`, `S01.stuck-recover`).** Five identical `ls` calls: the fourth pair sets STUCK; a new message moves it to IDLE and the run then reaches the script's `finish`.
   ```sh
-  uv run pytest tests/sdk/conversation/test_ask_agent.py -q
-  uv run python examples/01_standalone_sdk/28_ask_agent_example.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  CID=$(control-sdk conversation new --script S01/repeat_ls.json --field id)
+  control-sdk conversation send "$CID" --text "List files" --run --check execution_status eq stuck --check script_left eq 2
+  control-sdk conversation send "$CID" --text "Try something else" --check execution_status eq idle
+  control-sdk conversation run "$CID" --check execution_status eq finished --check last_agent_message eq recovered
   ```
-  The tests pass; the example prints three answers obtained while `run()` is still going and a final answer after it ends.
-- **Structured output (`S01.structured-output`).**
+- **`run()` alone on a stuck conversation (`S01.stuck-recover`).** The same pattern, resumed with `run()` and no new message.
   ```sh
-  uv run pytest tests/sdk/tool/test_response_schema.py -q
-  uv run python examples/01_standalone_sdk/56_structured_output.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  CID=$(control-sdk conversation new --script S01/repeat_ls.json --field id)
+  control-sdk conversation send "$CID" --text "List files" --run --check execution_status eq stuck
+  control-sdk conversation run "$CID" --check script_left lt 2
   ```
-  35 tests pass; the example prints typed `CommandRationale` objects per terminal call and a `ProjectFacts` instance from `finish`.
-- **Error recovery inside a step (`S01.malformed-tool-call`, `S01.unknown-tool`, `S01.tool-exception`, `S01.content-policy`, `S01.context-overflow`).**
+  Known failure (reproduced 2026-10-13, not yet filed): `run()` resets STUCK to RUNNING, but the detector sees the same repeated pairs since the last user message before any LLM call and sets STUCK again (`script_left` stays 2, status `stuck`). Only a new user message gets a detected-stuck conversation moving; the unit test `test_run_recovers_from_stuck` sets STUCK by hand with no repeating events, so it never meets this.
+- **Custom thresholds (`S01.stuck-thresholds`).** Three identical `ls` calls with the defaults (no stuck) and with `stuck_detection_thresholds={"action_observation": 2}`.
   ```sh
-  uv run pytest tests/sdk/agent/test_fix_malformed_tool_arguments.py tests/sdk/agent/test_tool_validation_error_message.py tests/sdk/agent/test_nonexistent_tool_handling.py tests/sdk/agent/test_tool_execution_error_handling.py tests/sdk/agent/test_agent_content_policy_violation.py tests/sdk/agent/test_agent_context_window_condensation.py -q
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S01/loop --arg thresholds \
+    --check default.status eq finished --check default.llm_calls eq 4 \
+    --check custom.status eq stuck --check custom.llm_calls eq 2
   ```
-  The tests pass; each error turns into an event the model sees, or a condensation request, instead of ending the run.
-- **Iterative refinement, untested (`S01.iterative-refinement`).** Only the example exercises it.
+- **The repeated-error nudge (`S01.stuck-nudge`).** Three identical calls to a missing tool get one environment nudge; the model then finishes and the run is not STUCK.
   ```sh
-  MAX_ITERATIONS=2 PHASE_MAX_ITERATIONS=15 uv run python examples/01_standalone_sdk/31_iterative_refinement.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  CID=$(control-sdk conversation new --script S01/repeat_error.json --field id)
+  control-sdk conversation send "$CID" --text "Do it" --run \
+    --check execution_status eq finished --check last_agent_message eq "switched approach"
+  control-sdk conversation events "$CID" --kind MessageEvent --source environment \
+    --check count eq 1 --check events.0.text contains "3 times in a row"
   ```
-  The example converts a sample COBOL file to Java, scores it with a critique conversation, and repeats with feedback until the score reaches `QUALITY_THRESHOLD` (default 90) or `MAX_ITERATIONS`.
-- **Real-model task runs (`S01.run-to-finish`, `S01.context-overflow`).** Needs a model key for the integration runner.
+- **Concurrent tool calls (`S01.parallel-tools`, `S01.finish-truncates-batch`).** Four one-second `sleeper` calls in one reply with `tool_concurrency_limit=1` and `4`; a batch where one call raises; a batch with `finish` in the middle.
   ```sh
-  uv run python tests/integration/run_infer.py --llm-config '{"model": "litellm_proxy/anthropic/claude-sonnet-4-5-20250929"}' --eval-ids t01_fix_simple_typo,t02_add_bash_hello
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S01/loop --arg parallel \
+    --check sequential_seconds ge 4 --check parallel_seconds lt 2 --check parallel_overlap eq true \
+    --check observation_order.0 eq s0 --check observation_order.3 eq s3 \
+    --check with_failure.status eq finished --check with_failure.results.0 eq ObservationEvent:ok1 \
+    --check with_failure.results.1 eq AgentErrorEvent:sleeper --check with_failure.results.2 eq ObservationEvent:ok2 \
+    --check finish_batch.status eq finished --check finish_batch.ran len-eq 1 --check finish_batch.ran.0 eq before \
+    --check limit_zero_rejected eq true
   ```
-  Each selected task reports pass/fail in `tests/integration/outputs/`.
+  Results stay in call order even when they finish out of order; the failing call becomes an `AgentErrorEvent` and the others keep their results; the call after `finish` never runs.
+- **Resource locks (`S01.parallel-resource-locks`).** Pairs of concurrent `sleeper` calls: same key, different keys, no declaration (per-tool mutex), and declared with no keys.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S01/loop --arg locks \
+    --check same_key_overlap eq false --check different_keys_overlap eq true \
+    --check undeclared_overlap eq false --check declared_no_keys_overlap eq true
+  ```
+- **An exception inside a tool (`S01.tool-exception`).**
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S01/loop --arg tool-exception \
+    --check status eq finished --check agent_errors eq 1 --check error_tool eq sleeper \
+    --check error_text contains "failed on purpose"
+  ```
+- **A message sent while the agent works (`S01.message-while-running`).** `run()` in a thread, the terminal sleeping two seconds, a second message sent from the main thread.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S01/loop --arg message-while-running \
+    --check status_mid_run eq running --check status eq finished --check user_messages len-eq 2 \
+    --check second_call_saw contains pineapple --check llm_calls eq 2
+  ```
+- **The async loop (`S01.async-step`, `S01.message-while-running`).** `arun()` with an LLM call that takes two seconds; the program takes the state lock and sends a message while the call is in flight.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S01/loop --arg async \
+    --check lock_wait_seconds lt 0.5 --check status_mid_call eq running --check status eq finished \
+    --check actions.0 eq terminal --check actions.1 eq finish --check user_messages eq 2
+  ```
+- **Images (`S01.image-input`, `S01.image-non-vision`).** A URL and a `data:` image to a vision model; 21 and 2 large base64 images to an Anthropic model; an image to a model without vision.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S01/loop --arg image-input \
+    --check openai.vision_active eq true --check openai.status eq finished \
+    --check openai.image_urls.0 matches '^https://' --check openai.image_urls.1 matches '^data:image/png' \
+    --check anthropic_21_images.images eq 21 --check anthropic_21_images.max_side le 2000 \
+    --check anthropic_2_images.max_side eq 2600
+  control-sdk program S01/loop --arg image-non-vision \
+    --check vision_active eq false --check status eq finished --check llm_calls eq 0 \
+    --check agent_reply contains "does not support image"
+  ```
+  The vision-profile substitution needs a vision profile tool configured; it is not driven here.
+- **Side questions (`S01.ask-agent`).** `ask_agent` while `run()` is in flight, after it ends, and when the side call overflows the context.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S01/loop --arg ask-agent \
+    --check during_run.answer contains "answer from" --check during_run.status eq running \
+    --check after_run.answer contains "answer from" --check after_run.events_added eq 0 \
+    --check after_run.status_after eq finished --check no_side_question_in_events eq true \
+    --check context_error_raised eq LLMContextWindowExceedError \
+    --check run_actions.0 eq terminal --check registry contains ask-agent-llm
+  ```
+- **Structured output (`S01.structured-output`).** `response_schema` on `TerminalTool` and on `FinishTool`; two invalid schemas.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S01/loop --arg structured-output \
+    --check status eq finished --check facts_type eq ProjectFacts --check facts len-eq 3 \
+    --check rationale_type eq CommandRationale --check rationale_purpose eq "see the files" \
+    --check finish_schema_fields contains facts --check finish_schema_fields contains message \
+    --check rejected.reserved_name eq ValueError --check rejected.field_collision eq ValueError
+  ```
+- **Context overflow (`S01.context-overflow`).** A context-window error with an `LLMSummarizingCondenser` (emits a `CondensationRequest` and the run continues) and without one (the run ends in ERROR).
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S01/loop --arg context-overflow \
+    --check with_condenser.status eq finished --check with_condenser.condensation_requests eq 1 \
+    --check without_condenser.status eq error --check without_condenser.raised eq ConversationRunError \
+    --check without_condenser.codes.0 eq LLMContextWindowExceedError
+  ```
+- **The loop with a real model (`S01.run-to-finish`, `S01.response-dispatch`, `S01.ask-agent`).** Live.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  CID=$(control-sdk conversation new --field id)
+  control-sdk conversation send "$CID" --run \
+    --text "Using the terminal, create facts.txt containing the line 'loop ok', then finish." \
+    --check execution_status eq finished
+  control-sdk exec --expect-output "loop ok" -- cat facts.txt
+  control-sdk exec --model-env --expect-output "All done" -- python examples/01_standalone_sdk/01_hello_world.py
+  control-sdk exec --model-env --expect-output EXAMPLE_COST -- python examples/01_standalone_sdk/28_ask_agent_example.py
+  ```
+- **Examples 18, 20, 45 and 56 (`S01.message-while-running`, `S01.stuck-detect`, `S01.parallel-tools`, `S01.structured-output`).** Live; example 20 prints `Final stuck status: False` when the model refuses to repeat itself, so only its completion is checked.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk exec --model-env --expect-output EXAMPLE_COST -- python examples/01_standalone_sdk/18_send_message_while_processing.py
+  control-sdk exec --model-env --expect-output "Final stuck status" -- python examples/01_standalone_sdk/20_stuck_detector.py
+  control-sdk exec --model-env --expect-output EXAMPLE_COST -- python examples/01_standalone_sdk/45_parallel_tool_execution.py
+  control-sdk exec --model-env --expect-output EXAMPLE_COST -- python examples/01_standalone_sdk/56_structured_output.py
+  ```
+- **Iterative refinement (`S01.iterative-refinement`).** Live; several full conversations per round.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk exec --model-env --env MAX_ITERATIONS=2 --env PHASE_MAX_ITERATIONS=15 --expect-output EXAMPLE_COST -- python examples/01_standalone_sdk/31_iterative_refinement.py
+  ```
+- **Real-model task runs (`S01.run-to-finish`, `S01.context-overflow`).** Live, through the integration runner.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk exec --model-env -- python tests/integration/run_infer.py --llm-config '{"model": "deepseek/deepseek-flash"}' --eval-ids t01_fix_simple_typo,t02_add_bash_hello
+  ```
+- **Example 17, image input on a real model (`S01.image-input`), blocked.** The example asserts `llm.vision_is_active()`; the run's DeepSeek model has no vision, so it needs a vision model key (and network to python.org).
 
 ## Gotchas
 
@@ -126,4 +274,7 @@ Preconditions:
 - `tool_concurrency_limit > 1` shares the conversation, filesystem and working directory between concurrent tools; races on shared state are the caller's problem unless the tool declares resource keys.
 - `ask_agent` copies the agent's LLM with streaming disabled; it is registered in `conversation.llm_registry` under usage id `ask-agent-llm`, so its cost shows up in the conversation stats separately from the agent's.
 - Example 18 and 28 run `conversation.run()` in a `threading.Thread`; join the thread before reading final state.
-- All pytest commands above passed on 4cc0582 (245 tests in the agent/conversation set, 27 in the status/stuck set).
+- The `Conversation(...)` factory does not accept `max_budget_per_run` (`TypeError: Conversation.__new__() got an unexpected keyword argument`); only `LocalConversation(...)` takes it.
+- `ConversationStateUpdateEvent`s are not delivered to `callbacks` in a local run; poll `conversation.state.execution_status` (from another thread) to watch status changes.
+- Once a run has ended STUCK, calling `run()` again is re-detected as STUCK straight away with no LLM call; only a new user message lets the agent continue.
+- `ConversationErrorEvent` is not exported from `openhands.sdk.event`; import it from `openhands.sdk.event.conversation_error`.

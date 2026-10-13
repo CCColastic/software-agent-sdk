@@ -47,53 +47,145 @@ Examples: `examples/02_remote_agent_server/02_convo_with_docker_sandboxed_server
 ## Driving it
 
 Preconditions:
+- `uv sync --dev` has run; `control-sdk` is on `PATH` (`export PATH="$PWD/.agents/skills/verify-sdk/scripts:$PATH"`). `sdk-map run` does both.
+- `tmux` and `git` on `PATH`. The remote bullets start the repo's own agent server (`python -m openhands.agent_server`) as a subprocess on a free `127.0.0.1` port inside the run, stop it at the end, and need nothing else: that is the server `DockerWorkspace` runs in a container, without the container.
+- An agent running inside that server cannot use the scripted `TestLLM` (it does not survive serialization to the server), so those programs point `LLM(base_url=...)` at a local OpenAI-compatible stand-in (`programs/S18/servers.py`, `FakeLLMServer`) that answers with the same script steps. Callback URLs and the Cloud API are local capture servers from the same file.
+- Live bullets: `DEEPSEEK_API_KEY` exported. Backend bullets: the named runtime (Docker daemon, `apptainer`, a Kubernetes cluster, Cloud or runtime-API keys); none is available here.
 
-- `uv sync --dev` has run.
-- For backend bullets: the named runtime (a running Docker daemon, `apptainer`, a Kubernetes cluster with agent-sandbox, or cloud/runtime API keys) and network to pull `ghcr.io/openhands/agent-server` images. None of these is available here (the Docker CLI exists but no daemon is running).
-
-- **Local workspace (`S18.workspace-factory`, `S18.local-ops`, `S18.local-pause-resume`), factory and ops untested.** Deterministic check without a model.
+- **Local workspace (`S18.workspace-factory`, `S18.local-ops`, `S18.local-pause-resume`, `S18.completion-callback`, `S18.conversation-binding`).** `Workspace(working_dir=str|Path)` builds a `LocalWorkspace`; commands, copies and git state come back as `CommandResult`, `FileOperationResult`, `GitChange`/`GitDiff`; a scripted agent runs in it under `AUTOMATION_CALLBACK_URL`, and the context exit POSTs the outcome.
   ```sh
-  uv run pytest tests/workspace/test_workspace_pause_resume.py tests/sdk/workspace/test_local_workspace.py -q
-  uv run python -c "
-  import tempfile, pathlib
-  from openhands.sdk.workspace import Workspace, LocalWorkspace
-  d = tempfile.mkdtemp(); ws = Workspace(working_dir=d); assert isinstance(ws, LocalWorkspace)
-  with ws:
-      r = ws.execute_command('echo hi && pwd'); print(r.exit_code, r.stdout.split())
-      pathlib.Path(d, 'a.txt').write_text('x')
-      print(ws.file_upload(f'{d}/a.txt', f'{d}/sub/b.txt').success, ws.file_download(f'{d}/sub/b.txt', f'{d}/c.txt').success)
-  "
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S18/local_workspace \
+    --check factory_type eq LocalWorkspace --check factory_path_type eq LocalWorkspace --check working_dir_is_str eq true \
+    --check exit_code eq 0 --check stdout_lines.0 eq hi --check pwd_is_root eq true \
+    --check failing_exit eq 3 --check failing_stderr eq oops --check cwd_override eq /tmp --check timeout_occurred eq true \
+    --check upload_ok eq true --check upload_size eq 8 --check upload_created_parents eq true \
+    --check download_ok eq true --check download_content eq payload \
+    --check missing_download_success eq false --check missing_download_error eq true \
+    --check git_changes contains ADDED:new.txt --check git_changes contains UPDATED:f.txt \
+    --check git_diff_original eq one --check git_diff_modified matches 'one\ntwo' \
+    --check pause_resume_error missing --check conversation_type eq LocalConversation --check agent_file eq from-agent \
+    --check callback_posts eq 1 --check callback_status eq COMPLETED --check callback_run_id eq run-42 \
+    --check callback_has_cost eq true --check callback_auth eq "Bearer cb-token" \
+    --check failed_status eq FAILED --check failed_error_code eq RuntimeError \
+    --check posts_after_unset eq 0 --check unreachable_error missing
   ```
-  15 tests pass; the snippet prints `0 ['hi', '<tmpdir>']` and `True True`.
-- **Remote workspace protocol (`S18.remote-client`, `S18.remote-command-exec`, `S18.remote-files-git`, `S18.runtime-scope`, `S18.remote-alive`, `S18.async-remote`, `S18.remote-settings`, `S18.repos-and-skills`, `S18.completion-callback`, `S18.conversation-binding`).** HTTP is mocked.
+  An exception inside the workspace context posts `FAILED` with a classified `error`; without the URL nothing is posted; an unreachable URL is logged, not raised.
+- **Remote workspace against a local agent server (`S18.remote-client`, `S18.remote-command-exec`, `S18.remote-files-git`, `S18.remote-alive`, `S18.async-remote`).** The server requires a session key; the program uses the workspace's direct calls, then `AsyncRemoteWorkspace`, then stops the server.
   ```sh
-  uv run pytest tests/sdk/workspace tests/sdk/conversation/test_conversation_factory.py -q
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S18/remote_workspace --arg ops \
+    --check type eq RemoteWorkspace --check host_normalized eq true --check client_lazy eq true \
+    --check client_base_url eq true --check sends_session_key eq true --check reset_client_cleared eq true \
+    --check wrong_key.exit eq -1 --check wrong_key.stderr contains 401 \
+    --check exec.exit eq 0 --check exec.lines.0 eq hi --check exec_pwd_ok eq true \
+    --check failing_exit eq 4 --check failing_output eq bad \
+    --check long_lines eq 40 --check long_unique_in_order eq true --check concurrent_isolated eq true \
+    --check timeout_occurred eq true \
+    --check upload_ok eq true --check upload_bytes_ok eq true --check download_ok eq true \
+    --check missing_download_success eq false \
+    --check git_changes contains ADDED:new.txt --check git_changes contains UPDATED:f.txt \
+    --check git_diff_modified matches 'one\ntwo' \
+    --check alive eq true --check alive_wrong_port eq false --check alive_after_stop eq false \
+    --check async.exec eq async-hi --check async.exit eq 0 --check async.upload eq true \
+    --check async.download eq true --check async.git_changes eq 2 --check async.alive eq true
   ```
-  157 pass.
-- **Backends with mocked subprocess and HTTP (`S18.docker-*`, `S18.api-remote-*`, `S18.cloud-*`, `S18.apptainer`, `S18.agent-sandbox`); `keep_alive`, `pause_on_close` and `session_id` reattach of `APIRemoteWorkspace` untested.**
+  A wrong session key does not raise: `execute_command` returns `exit_code` -1 with the HTTP 401 in `stderr` (errors of the command protocol are folded into the result). Forty lines printed over about two seconds arrive once and in order across polls; two commands run from two threads keep their own output.
+- **Workspace factory with a `Path`, remote (`S18.workspace-factory`).** The same factory call with a `pathlib.Path` working directory and a host.
   ```sh
-  uv run pytest tests/workspace -q
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S18/remote_workspace --arg ops --check path_working_dir_error missing --check type eq RemoteWorkspace
   ```
-  208 pass; no container, cluster or cloud call is made.
-- **Real Docker sandbox (`S18.docker-start`, `S18.docker-lifecycle`, `S18.remote-command-exec`), blocked here (needs `docker`, `network`).** Without a model first, then the example.
+  Known failure (reproduced 2026-10-13, not yet filed): `Workspace(host=..., working_dir=Path(...))` (and `RemoteWorkspace(working_dir=Path(...))`) raises `pydantic_core.ValidationError: 1 validation error for RemoteWorkspace working_dir Input should be a valid string [type=string_type, input_type=PosixPath]`. `RemoteWorkspaceMixin` redeclares `working_dir: str` without the `BeforeValidator` that `BaseWorkspace` uses to accept a `Path`; the local branch accepts one.
+- **Settings from the server (`S18.remote-settings`).** LLM settings, an LLM profile, two secrets and an MCP server are stored through the server's settings API; the workspace reads them back.
   ```sh
-  uv run python -c "
-  from openhands.workspace import DockerWorkspace
-  with DockerWorkspace(server_image='ghcr.io/openhands/agent-server:latest-python') as ws:
-      print(ws.execute_command('echo hi && pwd').stdout); ws.pause(); ws.resume(); print(ws.alive)
-  "
-  uv run python examples/02_remote_agent_server/02_convo_with_docker_sandboxed_server.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S18/remote_workspace --arg settings \
+    --check patch_status eq 200 --check patch_mcp_status eq 200 \
+    --check get_llm.model eq openai/settings-model --check get_llm.base_url eq "http://127.0.0.1:9/v1" --check get_llm.key_ok eq true \
+    --check get_llm_override.model eq openai/override --check get_llm_override.temperature eq 0.3 \
+    --check get_llm_profile.model eq openai/fast-model --check get_llm_profile.usage_id eq profile:fast \
+    --check get_llm_active_profile eq openai/fast-model --check missing_profile_error eq FileNotFoundError \
+    --check secrets contains PROJECT_TOKEN --check secret_type eq LookupSecret --check secret_url_ok eq true \
+    --check secret_has_session_header eq true --check secret_resolves eq true --check secrets_filtered len-eq 1 \
+    --check mcp_servers contains fetch --check mcp_fetch_command eq uvx \
+    --check secret_value_missing missing --check secret_value_present eq tok-1
   ```
-  The snippet prints `hi`, `/workspace` and `True`, and the container is gone afterwards (`docker ps -a`); the example runs a conversation inside the container and prints its command check and cost.
-- **Runtime API, Cloud, Apptainer, agent-sandbox (`S18.api-remote-start`, `S18.cloud-sandbox`, `S18.cloud-credentials`, `S18.apptainer`, `S18.agent-sandbox`), blocked here (need `cloud`, `apptainer` or `k8s`).**
+  Without an active profile `get_llm()` returns the legacy `agent_settings.llm`; after activating `fast` it returns that profile. A `LookupSecret` carries the session header and resolves against the server.
+- **A conversation in the remote workspace, runtime scope and callback (`S18.conversation-binding`, `S18.runtime-scope`, `S18.completion-callback`).** `Conversation(workspace=RemoteWorkspace)` runs a scripted agent inside the server (its LLM is the local scripted endpoint); a second workspace scoped to that conversation runs commands and file calls in its runtime; the workspace context posts the callback with the conversation id.
   ```sh
-  uv run python examples/02_remote_agent_server/04_convo_with_api_sandboxed_server.py
-  uv run python examples/02_remote_agent_server/07_convo_with_cloud_workspace.py
-  uv run python examples/02_remote_agent_server/10_cloud_workspace_share_credentials.py
-  uv run python examples/02_remote_agent_server/08_convo_with_apptainer_sandboxed_server.py
-  uv run python examples/02_remote_agent_server/17_convo_with_agent_sandbox_server.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S18/remote_workspace --arg conversation \
+    --check conversation_type eq RemoteConversation --check status eq finished \
+    --check actions eq 2 --check observations eq 2 --check callback_events gt 0 \
+    --check agent_file eq remote-agent --check registered_conversation eq true \
+    --check scoped_prefix eq true --check scoped_exec.0 eq remote-agent \
+    --check scoped_upload eq true --check scoped_outside_upload eq false \
+    --check unscoped_release_error contains "conversation scope" \
+    --check unknown_scope.exit eq -1 --check unknown_scope.stderr contains 404 \
+    --check runtime_key_error eq HTTPStatusError \
+    --check callback.posts eq 1 --check callback.status eq COMPLETED \
+    --check callback.conversation_id_ok eq true --check callback.run_id eq remote-run-1 --check callback.has_cost eq true
   ```
-  Each starts its sandbox, runs a direct `execute_command` check and a conversation, and tears the sandbox down on exit (example 17 also pauses and resumes the pod between two tasks).
+  A scoped upload outside the conversation's workspace is refused (422). The plain local server has no `/runtime/credentials` route (that is the Docker-runtime server's), so `get_runtime_session_key()` raises `HTTPStatusError` here; issuing and releasing a runtime credential needs the server in Docker-runtime mode (blocked, needs `docker`).
+- **Repositories and skills (`S18.repos-and-skills`).** Three local `file://` repositories (a string, a dict with `ref`, a `RepoSource`) are cloned, rendered for the prompt, and their `.openhands/skills` are loaded through the server's `/api/skills`.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S18/remote_workspace --arg repos \
+    --check clone.success_count eq 3 --check clone.failed len-eq 0 \
+    --check clone.dirs contains alpha --check clone.dirs contains beta --check clone.dirs contains gamma \
+    --check cloned_files_exist eq true --check short_url_without_provider eq rejected \
+    --check short_url_with_provider eq github --check context_mentions len-eq 3 --check empty_context eq "" \
+    --check skills contains alpha-notes --check skills contains beta-notes \
+    --check skills len-eq 3 --check context_skills len-eq 3 --check context_load_public eq false \
+    --check fallback_skills eq 0 --check fallback_load_public eq true
+  ```
+  Cloning provider repositories with tokens (`owner/repo` plus a provider) needs network and a provider token; the token lookup itself (`_get_secret_value`) is proven in the settings bullet.
+- **Cloud workspace in local agent-server mode (`S18.cloud-local-mode`, `S18.cloud-credentials`, `S18.cloud-automation-tags`).** As an automation inside a Cloud sandbox: `AGENT_SERVER_PORT`, `SANDBOX_ID`, `SESSION_API_KEY` and `AUTOMATION_*` are set, the agent server is local, and the Cloud API is a local stand-in whose first account read fails with a 500.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S18/cloud_local \
+    --check host eq true --check session_key_from_env eq true --check exec.0 eq in-sandbox --check alive eq true \
+    --check get_llm.model eq openai/cloud-model --check get_llm.base_url_ok eq true --check get_llm.requests eq 2 \
+    --check get_llm_override eq openai/other --check get_llm_profile eq openai/fast-model \
+    --check missing_profile eq FileNotFoundError \
+    --check secrets contains GITHUB_TOKEN --check secret_url_ok eq true --check secret_session_header eq true \
+    --check secrets_filtered len-eq 1 \
+    --check mcp.fs eq stdio --check mcp.sse_0 eq sse --check mcp.shttp_0 eq streamable-http \
+    --check forbidden_error eq 403 --check forbidden_requests eq 1 \
+    --check default_tags.automationtrigger eq cron --check default_tags.automationid eq a1 \
+    --check default_tags.automationname eq Nightly --check default_tags.automationrunid eq run-7 \
+    --check conversation_tags.team eq infra --check conversation_tags.automationrunid eq run-7 \
+    --check conversation_status eq finished --check agent_file eq cloud \
+    --check callback.posts eq 1 --check callback.status eq COMPLETED --check callback.run_id eq run-7 \
+    --check callback.conversation_id_ok eq true --check callback.auth eq "Bearer cloud-key" \
+    --check sandbox_creates eq 0 --check sandbox_deletes eq 0
+  ```
+  The 500 is retried (two account reads), the 403 is not (one). The conversation's tags merge the automation tags with the user's; the workspace never creates or deletes a sandbox in this mode.
+- **Live: a real model in a local agent server (`S18.conversation-binding`, `S18.remote-command-exec`, `S18.remote-settings`).** Examples 01 (remote conversation with hooks and a direct `execute_command`) and 13 (`get_llm()` from the server's settings, then a conversation).
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk exec --model-env --expect-output EXAMPLE_COST -- python examples/02_remote_agent_server/01_convo_with_local_agent_server.py
+  control-sdk exec --model-env --expect-output EXAMPLE_COST -- python examples/02_remote_agent_server/13_workspace_get_llm.py
+  ```
+- **Docker sandbox (`S18.docker-start`, `S18.docker-dev-build`, `S18.docker-lifecycle`), blocked: needs a running Docker daemon and network to pull `ghcr.io/openhands/agent-server`.** Example 02 starts the container, runs `execute_command` and a conversation, and removes the container on exit (`docker ps -a` is clean afterwards).
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk exec --model-env --expect-output EXAMPLE_COST -- python examples/02_remote_agent_server/02_convo_with_docker_sandboxed_server.py
+  ```
+- **Runtime API and Cloud sandboxes (`S18.api-remote-start`, `S18.api-remote-lifecycle`, `S18.cloud-sandbox`, `S18.cloud-credentials`), blocked: need `RUNTIME_API_URL`/`RUNTIME_API_KEY` or `OPENHANDS_CLOUD_API_KEY` and network.**
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk exec --model-env -- python examples/02_remote_agent_server/04_convo_with_api_sandboxed_server.py
+  control-sdk exec --model-env -- python examples/02_remote_agent_server/07_convo_with_cloud_workspace.py
+  control-sdk exec --model-env -- python examples/02_remote_agent_server/10_cloud_workspace_share_credentials.py
+  ```
+- **Apptainer and agent-sandbox (`S18.apptainer`, `S18.agent-sandbox`), blocked: need `apptainer`, or a Kubernetes cluster with the agent-sandbox controller and `openhands-workspace[agent-sandbox]`.**
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk exec --model-env -- python examples/02_remote_agent_server/08_convo_with_apptainer_sandboxed_server.py
+  control-sdk exec --model-env -- python examples/02_remote_agent_server/17_convo_with_agent_sandbox_server.py
+  ```
 
 ## Gotchas
 

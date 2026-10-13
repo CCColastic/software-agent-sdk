@@ -57,8 +57,9 @@ bullet there (`sdk-map run --file Snn --only <ID>` from that worktree's own
 whose `Source:` prefixes cover it and lists `unowned_product_paths` under
 `openhands-sdk/`, `openhands-tools/` and `openhands-workspace/` that no family
 claims. Map each of those to a family or an explicit reason it is not a
-feature a program calls (an internal refactor, `utils/`, `io/`; the index's
-"Not mapped" section lists the standing ones). For shared models (events,
+feature a program calls (an internal refactor, `utils/`, `io/`). Paths the
+index's "Not mapped" section names come back as `not_mapped`, already
+explained; a path that stays unowned needs a family or a line there. For shared models (events,
 LLM config, settings) expand to every family that uses them rather than
 sampling one. A new public API (an export in `openhands.sdk.__init__`, a new
 tool, a new example) needs a sub-feature; add it per the family entry

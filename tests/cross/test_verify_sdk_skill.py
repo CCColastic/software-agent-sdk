@@ -298,6 +298,15 @@ def test_a_block_that_needs_a_model_is_skipped_whole_without_a_key(
     assert "1 model-backed block(s) skipped" in row["note"]
 
 
+def test_a_no_model_block_runs_its_example_without_a_key(demo_map, tmp_path, capsys):
+    _bullet_map(demo_map, "# no model\ntest -n examples/ && echo ran-the-example")
+    code, out = _run(
+        capsys, "run", "--file", "S98", "--only", "S98.ok", "--out", str(tmp_path / "r")
+    )
+    (row,) = out["results"]
+    assert row["result"] == "pass", row
+
+
 def test_exit_3_means_blocked_not_failed(demo_map, tmp_path, capsys):
     _bullet_map(demo_map, "echo missing key\nexit 3")
     code, out = _run(
@@ -315,7 +324,7 @@ def test_check_rejects_pytest_and_broken_control_sdk_calls(demo_map, capsys):
         "control-sdk conversation sned x\n"
         "control-sdk program S98/nowhere --check ok eq true\n"
         "control-sdk conversation new --script S98/missing.json --field id\n"
-        "control-sdk conversation send \"$CID\" --text hi --run \\\n"
+        'control-sdk conversation send "$CID" --text hi --run \\\n'
         "  --check execution_status eq finished",
     )
     code, out = _run(capsys, "check", "--file", "S98")

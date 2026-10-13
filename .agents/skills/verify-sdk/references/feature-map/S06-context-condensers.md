@@ -46,40 +46,186 @@ Examples: `examples/01_standalone_sdk/14_context_condenser.py`, `examples/01_sta
 ## Driving it
 
 Preconditions:
-- `uv sync --dev` has run.
-- For examples and integration tests: `LLM_API_KEY` and `LLM_MODEL` exported; `tmux` on `PATH` (the examples use `TerminalTool`).
+- `uv sync --dev` has run; `control-sdk` is on `PATH` (`export PATH="$PWD/.agents/skills/verify-sdk/scripts:$PATH"`). `sdk-map run` does both.
+- `tmux` on `PATH` (the condenser conversations use `TerminalTool`).
+- Live bullets: `DEEPSEEK_API_KEY` exported.
 
-- **AgentContext and system prompt (`S06.context-*`, `S06.system-prompt-*`, `S06.persona-soul`).**
+The programs under `programs/S06/` record every scripted LLM call (`recorder.py`, a `TestLLM` subclass), so checks read the exact system blocks, user messages and summary prompts the SDK sent.
+
+- **What the model is sent from an `AgentContext` (`S06.context-suffixes`, `S06.context-skills`, `S06.context-secrets`, `S06.context-datetime`).** A conversation whose context has an always-on skill, a keyword skill, a disabled skill, both suffixes, two secrets and a fixed date runs three scripted turns: the keyword (in another case), the keyword again, and a plain message.
   ```sh
-  uv run pytest tests/sdk/context/test_agent_context.py tests/sdk/context/test_agent_context_serialization.py tests/sdk/context/test_agent_context_model_specific.py tests/sdk/context/test_prompt_model_spec.py tests/sdk/context/test_prompt_absolute_path.py -q
-  uv run pytest tests/sdk/context/prompts -q
-  uv run python examples/01_standalone_sdk/03_activate_skill.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S06/context_prompt \
+    --check llm_calls eq 3 --check system_blocks eq 2 \
+    --check static_has_sys_suffix eq false --check dynamic_has_sys_suffix eq true \
+    --check repo_skill_in_dynamic eq true --check repo_skill_in_static eq false \
+    --check disabled_skill_in_prompt eq false --check keyword_skill_body_in_system eq false \
+    --check keyword_skill_listed eq true \
+    --check secret_names_in_dynamic len-eq 2 --check secret_description_in_dynamic eq true \
+    --check secret_value_sent eq false --check secret_in_plain_dump eq false \
+    --check secret_in_cipher_dump eq false --check secret_after_cipher_roundtrip eq true \
+    --check secret_in_persisted_state eq false \
+    --check datetime_in_dynamic eq true --check datetime_in_static eq false \
+    --check turn1_has_skill eq true --check turn1_has_user_suffix eq true \
+    --check turn2_has_skill eq false --check turn2_has_user_suffix eq true \
+    --check turn3_has_user_suffix eq true --check activated_skills len-eq 1 \
+    --check activated_skills.0 eq cat-voice --check duplicate_rejected eq true \
+    --check blank_user_suffix missing
   ```
-  The tests pass; the example's reply reflects the triggered skill's content.
-- **Persistent memory (`S06.memory-load`, `S06.memory-write-path`).**
+  The system message has two blocks: the static prompt, then the dynamic block with the repo skill, the `<available_skills>` entry for the keyword skill, the secret names and description (never a value), the date and the suffix. The keyword skill's body arrives once, appended to the first user message that matches; the user suffix is on every turn.
+- **Which system prompt is built (`S06.system-prompt-registry`, `S06.system-prompt-model-specific`, `S06.system-prompt-custom`, `S06.persona-soul`).** Scripted one-turn conversations for each way of choosing the prompt; the saved `SystemPromptEvent` is read back. Then a `SOUL.md` is written into the run's `OH_PERSISTENCE_DIR` and a new program picks it up.
   ```sh
-  uv run pytest tests/sdk/context/test_memory.py tests/sdk/conversation/test_local_conversation_memory.py -q
-  uv run python examples/01_standalone_sdk/55_persistent_memory.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S06/prompt_variants \
+    --check default_tags contains SOUL --check default_tags contains SECURITY --check default_tags contains MEMORY \
+    --check static_same_across_contexts eq true --check static_has_dynamic_values eq false \
+    --check dynamic_has_values eq true --check soul_default eq true \
+    --check planning_differs eq true --check planning_tags contains PLAN_STRUCTURE \
+    --check plain_gpt5_section eq false --check gpt5_gpt5_section eq true --check gpt5_preamble eq true \
+    --check codex_gpt5_section eq true --check codex_preamble eq false \
+    --check canonical_gpt5_section eq true --check override_preamble eq true \
+    --check claude_vendor eq '["Claude-Specific"]' --check gemini_vendor eq '["Gemini-Specific"]' \
+    --check gpt4o_vendor len-eq 0 --check gpt4o_baseline eq true \
+    --check inline_starts eq true --check inline_has_default_tags eq false \
+    --check template_rendered eq "Team blue prompt for test-model." \
+    --check missing_template_error eq FileNotFoundError --check missing_relative_error eq FileNotFoundError \
+    --check inline_and_file_error eq ValidationError \
+    --check persona_starts eq true --check persona_tags not-contains SOUL --check persona_tags not-contains ROLE \
+    --check persona_tags contains SECURITY --check persona_tags contains MEMORY
+  control-sdk exec -- sh -c 'printf "%s\n" "You are Bob, a terse build engineer." > "$OH_PERSISTENCE_DIR/SOUL.md"'
+  control-sdk program S06/prompt_variants --check soul_custom eq true --check soul_default eq false
   ```
-  In the example, session 1 writes `<tmp>/.openhands/memory/MEMORY.md` and the last lines print `<MEMORY_CONTEXT> injected into session 2's system prompt: True`.
-- **View and atomicity (`S06.view`, `S06.view-atomicity`).**
+- **Persistent memory (`S06.memory-load`, `S06.memory-write-path`).** User and project `MEMORY.md` indexes (and a daily log) are written to disk; conversations with `AgentContext(load_memory=True)` start over them, then over an oversized user index, then over an empty project index and an unreadable user index.
   ```sh
-  uv run pytest tests/sdk/context/view -q
-  uv run python tests/integration/run_infer.py --llm-config '{"model": "'"$LLM_MODEL"'", "extended_thinking": true}' --eval-ids c01_thinking_block_condenser
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S06/memory \
+    --check memory_before_first_message missing --check user_in_prompt eq true \
+    --check project_in_prompt eq true --check user_before_project eq true \
+    --check daily_log_in_prompt eq false --check memory_in_static eq false \
+    --check write_path_advertised eq true --check memory_in_agent_context_dump eq false \
+    --check memory_in_persisted_state eq false \
+    --check big_first_line_kept eq false --check big_last_line_kept eq true \
+    --check big_truncation_notice eq true --check big_partial_lines eq 0 --check big_kept_lines gt 50 \
+    --check broken_status eq finished --check broken_has_memory_block eq false
   ```
-  The unit tests pass; c01 only runs on models with extended thinking (Anthropic) and reports a skip otherwise.
-- **Summarizing condenser, soft and hard paths (`S06.summarizing-*`, `S06.soft-vs-hard`, `S06.hard-reset`, `S06.summary-llm-streaming`, `S06.noop-condenser`).**
+  The `<MEMORY>` guidance names `$OH_PERSISTENCE_DIR/memory/`, the same directory the loader read.
+- **Size-triggered summaries and the view (`S06.summarizing-size`, `S06.summary-llm-streaming`, `S06.view`, `S06.view-atomicity`).** A scripted agent runs ten terminal steps (one a parallel batch of two calls) under `LLMSummarizingCondenser(max_size=10, keep_first=2)` whose own scripted LLM has `stream=True` and an extra body.
   ```sh
-  uv run pytest tests/sdk/context/condenser -q
-  uv run python examples/01_standalone_sdk/14_context_condenser.py
-  uv run python tests/integration/run_infer.py --llm-config '{"model": "'"$LLM_MODEL"'"}' --test-type condenser
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S06/condense --arg size \
+    --check status eq finished --check condensations ge 2 \
+    --check first_summary eq "SUMMARY-1: echoed steps 0-3." --check first_offset eq 2 \
+    --check kept_first_two eq true --check atomic eq true \
+    --check view_kinds_head.2 eq CondensationSummaryEvent --check view_summaries eq 1 \
+    --check forgotten_in_view eq false --check view_has_request eq false \
+    --check summary_reached_agent eq true --check second_builds_on_first eq true \
+    --check summary_usage_ids eq '["condenser"]' --check summary_call_streamed eq false \
+    --check summary_call_kwargs not-contains extra_body --check summary_roles eq '["system", "user"]'
   ```
-  The example's later turns show `Condensation` events in the event log and a resumed conversation that still answers from the summary; `--test-type condenser` runs c01 to c05.
-- **Manual condense and overflow requests (`S06.manual-condense`, `S06.context-overflow-request`, `S06.condenser-resume`).**
+- **Token-triggered summaries (`S06.summarizing-tokens`).** `max_tokens` is three times the system prompt's token count; each command prints about 3 KB.
   ```sh
-  uv run pytest tests/sdk/conversation/test_condense.py tests/sdk/agent/test_agent_context_window_condensation.py tests/sdk/conversation/test_state_view_cache.py -q
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S06/condense --arg tokens \
+    --check status eq finished --check condensations ge 1 --check events_total lt 200 \
+    --check view_under_max_tokens eq true --check atomic eq true --check summary_reached_agent eq true
   ```
-- **Pipeline condenser (`S06.pipeline-condenser`), untested.** No test, example or integration test constructs `PipelineCondenser`.
+- **Reasons, minimum progress and the no-op condenser (`S06.summarizing-reasons`, `S06.view`, `S06.noop-condenser`).** The `View` of a finished 12-step conversation, with and without a `CondensationRequest`, is handed to condensers configured for each reason, as a custom condenser author would.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S06/condense --arg reasons \
+    --check request_view_has_request eq false --check request_view_unhandled eq true \
+    --check request_reasons eq '["request"]' --check events_reasons eq '["events"]' \
+    --check request_events_tokens_reasons eq '["events", "request", "tokens"]' \
+    --check most_aggressive_wins eq true \
+    --check minimum_progress_result eq View --check minimum_progress_summary_calls eq 0 \
+    --check keep_first_too_big_error eq ValidationError --check noop_same_view eq true
+  ```
+  Each reason forgets more: the request alone halves the view, the size reason forgets down to `max_size // 2`, and adding a token cap forgets the most; the combination takes the most aggressive.
+- **Soft versus hard requirements (`S06.soft-vs-hard`).** With `minimum_progress=0.95` nothing is worth forgetting: size pressure leaves the run alone (no summary call), while `conversation.condense()` (a hard request) resets the context.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S06/condense --arg soft \
+    --check status eq finished --check events gt 10 --check condensations_soft eq 0 \
+    --check summary_calls_soft eq 0 --check condensations_after_request eq 1 \
+    --check view_kinds_after_request eq '["SystemPromptEvent", "CondensationSummaryEvent"]' --check hard_offset eq 1
+  ```
+- **Hard context reset (`S06.hard-reset`).** The summary LLM fails on the normal path and on the first reset attempt, then answers; with every attempt failing, `condense()` raises and nothing is forgotten.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S06/condense --arg hard \
+    --check summary_calls eq 3 --check retry_shrank eq true --check condensations eq 1 \
+    --check summary eq "SUMMARY-H: reset." --check offset eq 1 --check system_prompt_kept eq true \
+    --check view_kinds eq '["SystemPromptEvent", "CondensationSummaryEvent"]' \
+    --check exhausted_error eq NoCondensationAvailableException --check exhausted_calls eq 3 \
+    --check exhausted_condensations eq 0
+  ```
+  The third summary prompt is shorter than the second: the retry capped each event at 0.8 of the longest one.
+- **Manual condense (`S06.manual-condense`).** `conversation.condense()` after a finished run, then another turn; and the `ValueError` without a condenser or with `NoOpCondenser`.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S06/condense --arg manual \
+    --check request_events eq 1 --check condensations eq 1 --check view_after lt 12 \
+    --check request_in_view eq false --check summary_calls eq 1 --check agent_calls_during_condense eq 0 \
+    --check error_after missing --check summary_reached_agent eq true \
+    --check none_error contains "No condenser configured" --check none_error contains LLMSummarizingCondenser \
+    --check noop_error contains "does not handle condensation requests"
+  ```
+- **Context-window errors (`S06.context-overflow-request`).** The agent's scripted LLM raises `LLMContextWindowExceedError` mid-task.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S06/condense --arg overflow \
+    --check with_error missing --check with_status eq finished --check with_requests eq 1 \
+    --check with_condensations eq 1 --check summary_reached_agent eq true \
+    --check without_status eq error --check without_requests eq 0 \
+    --check without_error_events eq '["LLMContextWindowExceedError"]'
+  ```
+- **Resume a condensed conversation (`S06.condenser-resume`).** The conversation is closed after two condensations, reopened from its persisted events by id, and sent another message.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S06/condense --arg resume \
+    --check condensations ge 1 --check reopened_view_matches eq true --check rebuilt_view_matches eq true \
+    --check reopened_summaries eq 1 --check error_after_resume missing \
+    --check resumed_call_has_summary eq true --check resumed_status eq finished
+  ```
+- **Pipeline and no-op condensers in a conversation (`S06.pipeline-condenser`, `S06.noop-condenser`).** `PipelineCondenser([NoOpCondenser(), summarizer, second summarizer])` and a bare `NoOpCondenser` over the same long run.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S06/condense --arg pipeline \
+    --check pipeline_handles_requests eq true --check noop_only_pipeline_handles_requests eq false \
+    --check pipeline_status eq finished --check pipeline_condensations ge 1 --check pipeline_atomic eq true \
+    --check pipeline_second_member_calls eq 0 --check pipeline_condensations_after_request gt 1 \
+    --check noop_status eq finished --check noop_condensations eq 0 --check noop_view_len eq 20
+  ```
+  The second summarizer is never called: the pipeline stops at the first `Condensation`.
+- **Summaries from a real model (`S06.summarizing-size`, `S06.manual-condense`, `S06.view-atomicity`).** Live: the agent and the summary LLM are the run's model.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk program S06/condense --arg live \
+    --check status eq finished --check condensations ge 1 --check summary_nonempty eq true \
+    --check atomic eq true --check condensations_after_request gt 1
+  ```
+- **Example 14 (`S06.summarizing-size`, `S06.condenser-resume`, `S06.summary-llm-streaming`).** Live.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk exec --model-env --expect-output "Conversation finished with LLM Summarizing Condenser." -- python examples/01_standalone_sdk/14_context_condenser.py
+  ```
+  The example runs several turns, serializes and reloads the conversation, and keeps going after the reload.
+- **Example 55 (`S06.memory-load`, `S06.memory-write-path`).** Live: session 1 asks the agent to record a decision; session 2 starts over the same workspace.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk exec --model-env --expect-output "injected into session 2's system prompt: True" -- python examples/01_standalone_sdk/55_persistent_memory.py
+  ```
+- **Example 3 (`S06.context-suffixes`, `S06.context-skills`).** Live; also clones the public skills (needs network).
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk exec --model-env --expect-output "EXAMPLE_COST" -- python examples/01_standalone_sdk/03_activate_skill.py
+  ```
+- **Condenser integration tests (`S06.summarizing-size`, `S06.summarizing-tokens`, `S06.soft-vs-hard`, `S06.hard-reset`, `S06.context-overflow-request`).** Live, through the integration runner (c02 to c05).
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk exec --model-env -- python tests/integration/run_infer.py --llm-config '{"model": "deepseek/deepseek-flash"}' --eval-ids c02_hard_context_reset,c03_delayed_condensation,c04_token_condenser,c05_size_condenser
+  ```
+- **Thinking blocks across condensation (`S06.view-atomicity`), blocked.** `c01_thinking_block_condenser` needs an Anthropic model with extended thinking (and its key); with other models it reports a skip.
 
 ## Gotchas
 

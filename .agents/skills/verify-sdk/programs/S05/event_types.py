@@ -65,7 +65,11 @@ emit(
         if getattr(classified, "classification", None)
         else None,
         "secret_in_classification": secret
-        in (classified.classification.model_dump_json() if classified.classification else ""),
+        in (
+            classified.classification.model_dump_json()
+            if classified.classification
+            else ""
+        ),
         "failure_kinds": sorted(k.value for k in FailureKind),
     }
 )

@@ -49,52 +49,152 @@ Examples: `examples/01_standalone_sdk/03_activate_skill.py`, `examples/05_skills
 ## Driving it
 
 Preconditions:
+- `uv sync --dev` has run; `control-sdk` is on `PATH` (`export PATH="$PWD/.agents/skills/verify-sdk/scripts:$PATH"`). `sdk-map run` does both.
+- `git` and `tmux` on `PATH`.
+- The public-skills and remote marketplace bullets reach `github.com` (network); live bullets need `DEEPSEEK_API_KEY`.
 
-- `uv sync --dev` has run.
-- `LLM_API_KEY` and `LLM_MODEL` (optionally `LLM_BASE_URL`) exported for the example and real-LLM bullets.
+Each run has its own `HOME` and `OH_PERSISTENCE_DIR`, so user skills, the install store and the skills cache start empty. Programs in `programs/S07/` record what every scripted LLM call was sent (`recorder.py`).
 
-- **Skill model, loaders, triggers, validation (`S07.agentskills-load`, `S07.resources`, `S07.available-skills-prompt`, `S07.task-trigger`, `S07.inline-commands`, `S07.skill-mcp-json`, `S07.project-skills`, `S07.user-skills`, `S07.public-skills`, `S07.installed-lifecycle`, `S07.marketplace-install`, `S07.serialization`, `S07.path-rules`).** Deterministic; public-skills tests mock git.
+- **Always-on, keyword and task skills in a conversation (`S07.repo-skill-always-on`, `S07.keyword-trigger`, `S07.trigger-once`, `S07.task-trigger`, `S07.message-suffixes`, `S07.serialization`).** Three always-on skills (programmatic, a plain `.md` and an `AGENTS.md` loaded with `Skill.load`), a keyword skill on `rot13`/`cipher`, a task skill on `/deploy` with an input, both suffixes; four scripted turns: "ciphertext" (no whole-word match), "CIPHER, maybe ROT13", "rot13 again", "/deploy".
   ```sh
-  uv run pytest tests/sdk/skills -q
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S07/triggers \
+    --check llm_calls eq 4 --check loaded_names eq '["inline-rules", "style", "agents", "crypto", "deploy"]' \
+    --check always_on_every_call eq true --check always_on_in_static eq false --check sys_suffix_every_call eq true \
+    --check turn1_injected eq false --check turn2_injected eq true --check turn2_reported_keyword eq true \
+    --check turn3_injected eq false --check turn4_task_injected eq true --check turn4_asks_for_inputs eq true \
+    --check user_suffix_every_turn eq true --check activated eq '["crypto", "deploy"]' \
+    --check roundtrip_equal eq true --check trigger_types eq '[null, null, null, "keyword", "task"]'
   ```
-  369 tests pass.
-- **Prompt assembly and trigger activation (`S07.repo-skill-always-on`, `S07.keyword-trigger`, `S07.trigger-once`, `S07.message-suffixes`, `S07.agentskills-trigger`, `S07.disable-model-invocation`, `S07.disabled-skills`, `S07.merge-precedence`, `S07.load-project-flag`).**
+  The keyword skill is injected once, reporting `rot13` (first in its keyword list) although `CIPHER` appears first in the message.
+- **AgentSkills directories, `invoke_skill` and inline commands (`S07.agentskills-load`, `S07.resources`, `S07.available-skills-prompt`, `S07.agentskills-trigger`, `S07.invoke-skill-autoattach`, `S07.invoke-skill-run`, `S07.disable-model-invocation`, `S07.inline-commands`, `S07.skill-mcp-json`, `S07.serialization`).** `<workspace>/.agents/skills/` holds `rot13` (all frontmatter fields, `triggers: [encrypt]`, `scripts/`, `references/`, `assets/`, `.mcp.json`, inline commands), `hidden` (`disable-model-invocation`, `triggers: [sesame]`), `longdesc` (a 1500-character description) and `badname`; `~/.agents/skills/homeskill` is outside the workspace. The scripted agent calls `invoke_skill` for `"  rot13 "`, `nope`, `hidden`, `rot13`, `homeskill`; the user says "encrypt" and later "sesame".
   ```sh
-  uv run pytest tests/sdk/context/test_agent_context.py tests/sdk/context/prompts/test_default_registry.py tests/sdk/conversation/local/test_conversation_send_message.py tests/sdk/conversation/test_repo_root_project_skills.py -q
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S07/agentskills \
+    --check dict_sizes eq '[0, 0, 3]' --check agentskills eq '["hidden", "longdesc", "rot13"]' \
+    --check fields.license eq MIT --check fields.compatibility eq "needs bash" \
+    --check fields.metadata.author eq verify-sdk --check fields.allowed_tools eq '["terminal"]' \
+    --check fields.is_agentskills_format eq true --check reference_md_is_skill eq false \
+    --check name_errors len-eq 2 \
+    --check resources.scripts eq '["encrypt.sh"]' --check resources.references eq '["guide.md"]' \
+    --check resources.assets eq '["table.txt"]' --check resources.root_ok eq true \
+    --check discovered_scripts eq '["encrypt.sh"]' \
+    --check mcp_args.0 eq fallback --check mcp_args.1 matches '/\.agents/skills/rot13$' \
+    --check mcp_env_token eq from-env --check mcp_env_token_with_secret eq from-secret \
+    --check invalid_mcp_json_error eq SkillValidationError \
+    --check secret_in_dump eq false --check secret_after_cipher eq true --check skill_json_roundtrip eq true \
+    --check tools contains invoke_skill --check listed eq '["rot13", "longdesc", "homeskill"]' \
+    --check description_escaped eq true --check body_in_prompt eq false \
+    --check turn1_trigger_injected eq true --check turn2_hidden_injected eq true \
+    --check obs_is_error eq '[false, true, true, false, false]' --check first_has_body eq true \
+    --check inline_rendered eq true --check fenced_literal eq true --check escaped_literal eq true \
+    --check footer_relative eq true --check footer_home_absolute eq true \
+    --check unknown_error_lists eq true --check hidden_refused eq true --check invoked eq '["rot13", "homeskill"]' \
+    --check tools_default_tools_off eq '["invoke_skill"]' --check tools_hidden_only not-contains invoke_skill \
+    --check tools_legacy_only not-contains invoke_skill
   ```
-  All pass; the conversation tests use a mocked LLM.
-- **`invoke_skill` and path rules in a conversation (`S07.invoke-skill-autoattach`, `S07.invoke-skill-run`, `S07.path-rules`).**
+- **Long descriptions in `<available_skills>` (`S07.available-skills-prompt`).** The same layout; the `longdesc` entry the model sees.
   ```sh
-  uv run pytest tests/sdk/tool/test_invoke_skill.py tests/sdk/conversation/test_path_rules_injection.py -q
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S07/agentskills \
+    --check longdesc_full_in_prompt eq false --check longdesc_points_to_invoke_skill eq true \
+    --check longdesc_leaks_location eq false
   ```
-  All pass.
-- **Always-on and keyword skills with a real model (`S07.repo-skill-always-on`, `S07.keyword-trigger`, `S07.message-suffixes`, `S07.public-skills`).**
+  Expected: the description is cut at 1024 characters with `Call invoke_skill(name="longdesc") to load the full skill`, and no file location is shown (`to_prompt` omits `<location>` on purpose). Known failure (reproduced 2026-10-13, not yet filed): `Skill` truncates the description when the `SKILL.md` is loaded, with the notice `<response clipped><NOTE>... You can view the complete skill content at /abs/path/.agents/skills/longdesc/SKILL.md.</NOTE>`, so the prompt carries the absolute file path and no `invoke_skill` pointer (`longdesc_points_to_invoke_skill` false, `longdesc_leaks_location` true). The unit test `test_to_prompt_truncates_long_descriptions` sets the description after construction and so never sees the load-time notice.
+- **Path rules (`S07.path-rules`).** A `paths: [src/**/*.py]` AgentSkills rule and a nested `docs/AGENTS.md`; the scripted agent views `README.md`, `src/app/main.py`, `src/app/other.py` and `docs/guide.md` with `file_editor`.
   ```sh
-  uv run python examples/01_standalone_sdk/03_activate_skill.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S07/path_rules \
+    --check tool_results eq 4 --check readme_has_rule eq false --check main_has_py_rule eq true \
+    --check other_has_py_rule eq false --check guide_has_docs_rule eq true \
+    --check rules_in_system len-eq 0 --check root_rule_in_system eq true \
+    --check activated_path_rules eq '["py-rules", "agents:docs"]'
   ```
-  The first reply sounds like a grumpy cat and ends with `yay!`; after `flarglebargle!` the agent only praises the user. Needs network for the public-skills clone.
-- **AgentSkills directory with a real model (`S07.agentskills-load`, `S07.resources`, `S07.agentskills-trigger`, `S07.invoke-skill-autoattach`).**
+- **Project, user and installed sources and their precedence (`S07.project-skills`, `S07.load-project-flag`, `S07.user-skills`, `S07.merge-precedence`, `S07.disabled-skills`).** A git repo with skills at its root and in `pkg/` (the name `dup` in `.agents/skills`, `.openhands/skills` and `.openhands/microagents`, plus a skill with an invalid name), user skills in `~/.agents/skills`, `$OH_PERSISTENCE_DIR/skills` and `microagents`, and two installed skills (one disabled).
   ```sh
-  uv run python examples/05_skills_and_plugins/01_loading_agentskills/main.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S07/sources \
+    --check project_names eq '["agents", "claude", "dup", "layered", "only-micro", "only-oh", "shared"]' \
+    --check dup_content eq DUP-FROM-AGENTS \
+    --check user_names eq '["layered", "u-agents", "u-installed", "u-micro", "u-oh"]' \
+    --check layered_content eq PROJECT-LAYER \
+    --check merged eq '["b:primary-b", "a:primary-a", "c:secondary-c"]' \
+    --check flag_before_first_message eq '["dup", "keep"]' \
+    --check flag_after eq '["agents", "claude", "dup", "keep", "layered", "only-micro", "shared"]' \
+    --check flag_dup eq DUP-FROM-AGENTS --check flag_status eq finished \
+    --check flag_system_has_project eq true --check flag_system_has_explicit_dup eq false \
+    --check user_flag_names eq '["layered", "u-agents", "u-installed", "u-oh"]' \
+    --check user_flag_u_oh eq EXPLICIT-U-OH --check duplicate_error eq ValidationError \
+    --check no_flags_names len-eq 0
   ```
-  Part 1 prints the loaded `rot13-encryption` and `code-style-guide` skills and their resources without a key; part 2 asks to encrypt `hello world` and the agent answers `uryyb jbeyq`, usually through `scripts/encrypt.sh`.
-- **Model picks `invoke_skill` (`S07.available-skills-prompt`, `S07.invoke-skill-run`).**
+  `agents` (repo root `AGENTS.md`) and `shared` come from the git root; the broken skill is skipped without stopping the rest; project skills replace the explicit `dup` only once the first message is sent; `disabled_skills` drops `only-oh` and `u-micro` and ignores a name that never loaded.
+- **Install store and marketplace installs (`S07.installed-lifecycle`, `S07.marketplace-install`).** A local skill through install, reinstall, disable, forced reinstall, enable, update and uninstall; then a local `marketplace.json` with a standalone skill, a plugin with two skills and a missing source, installed twice.
   ```sh
-  uv run python tests/integration/run_infer.py --llm-config "{\"model\": \"$LLM_MODEL\"}" --eval-ids t09_invoke_skill
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S07/installed \
+    --check installed_name eq greeter --check store_file eq true --check reinstall_error eq FileExistsError \
+    --check enabled_after_disable len-eq 0 --check listed_after_disable eq '["greeter"]' \
+    --check enabled_after_force_reinstall len-eq 0 --check enabled_after_enable eq '["greeter"]' \
+    --check content_after_update eq GREETER-V2 --check get_installed eq true \
+    --check uninstall eq true --check uninstall_again eq false --check after_uninstall len-eq 0 \
+    --check dir_after_uninstall eq false \
+    --check marketplace_installed eq '["plug-one", "plug-two", "standalone"]' --check again_without_force len-eq 0
   ```
-  The run reports `t09_invoke_skill` as passed: the agent called `invoke_skill` for `frobnitz-converter` and answered 21.9905 m. Requires `LLM_API_KEY` and `LLM_BASE_URL`; the model string is passed to LiteLLM as given.
-- **Install store without a model (`S07.installed-lifecycle`).**
+- **Marketplace install from a GitHub blob URL (`S07.marketplace-install`).** Network: the same marketplace plus `https://github.com/OpenHands/extensions/blob/main/skills/github`.
   ```sh
-  uv run python examples/05_skills_and_plugins/03_managing_installed_skills/main.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S07/installed --arg remote --check after_marketplace eq '["github", "plug-one", "plug-two", "standalone"]'
   ```
-  Prints the tracked skills and `.installed.json` after install, disable, enable and uninstall, all inside a temporary directory.
-- **Marketplace skill install (`S07.marketplace-install`).** Writes to the real `~/.openhands/skills/installed/` and fetches `github` from GitHub.
+- **Public skills from a local extensions-shaped repository (`S07.public-skills`).** `load_public_skills(repo_url=<local git repo>)`: the default marketplace filter, no filter, another marketplace, the in-process cache within the branch TTL, a tag, then a fresh process after the repository is moved away (falls back to the cached clone), then `EXTENSIONS_REF=v1`.
   ```sh
-  uv run python examples/05_skills_and_plugins/04_mixed_marketplace_skills/main.py
-  uv run python examples/05_skills_and_plugins/04_mixed_marketplace_skills/main.py --install
-  uv run python examples/05_skills_and_plugins/04_mixed_marketplace_skills/main.py --list
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S07/public --arg local \
+    --check main_default eq '["alpha", "skills/gamma"]' --check main_all eq '["alpha", "beta", "skills/gamma"]' \
+    --check main_small eq '["beta"]' --check cache_clone eq true \
+    --check main_default_again eq '["alpha", "skills/gamma"]' --check tag_v1 eq '["alpha"]'
+  control-sdk exec -- mv "$SDK_VERIFY_RUN/extensions" "$SDK_VERIFY_RUN/extensions.gone"
+  control-sdk program S07/public --arg offline --check repo_present eq false --check main_default eq '["alpha", "skills/gamma"]'
+  control-sdk exec -- mv "$SDK_VERIFY_RUN/extensions.gone" "$SDK_VERIFY_RUN/extensions"
+  control-sdk program S07/public --arg env --env EXTENSIONS_REF=v1 --check ref eq v1 --check default_ref_load eq '["alpha"]'
   ```
-  The first run prints the two marketplace entries (one local, one remote); `--install` installs `greeting-helper` and `github`.
+- **Public skills from GitHub (`S07.public-skills`).** Network: `AgentContext(load_public_skills=True)` clones `OpenHands/extensions` into the run's skills cache.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S07/public --arg remote \
+    --check public_count gt 10 --check has_github eq true --check cache_clone eq true \
+    --check origin eq https://github.com/OpenHands/extensions
+  ```
+- **A real model uses an AgentSkills skill (`S07.available-skills-prompt`, `S07.invoke-skill-run`, `S07.invoke-skill-autoattach`).** Live: the task does not name the skill.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk program S07/live_invoke --check status eq finished --check invoked contains rot13 --check answer eq "uryyb jbeyq"
+  ```
+- **Example 3 (`S07.repo-skill-always-on`, `S07.keyword-trigger`, `S07.message-suffixes`, `S07.public-skills`).** Live; clones the public skills (network).
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk exec --model-env --expect-output "flarglebargle" --expect-output "EXAMPLE_COST" -- python examples/01_standalone_sdk/03_activate_skill.py
+  ```
+- **AgentSkills example (`S07.agentskills-load`, `S07.resources`, `S07.agentskills-trigger`, `S07.invoke-skill-autoattach`).** Live; part 1 lists `rot13-encryption` and `code-style-guide` with their resources, part 2 asks to encrypt `hello world`.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk exec --model-env --expect-output "rot13-encryption" --expect-output "EXAMPLE_COST" -- python examples/05_skills_and_plugins/01_loading_agentskills/main.py
+  ```
+- **Installed-skills example (`S07.installed-lifecycle`).** Needs no key, but `sdk-map run` treats every example as model-backed.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk exec --expect-output "DEMO 1: Installing local skills" -- python examples/05_skills_and_plugins/03_managing_installed_skills/main.py
+  ```
+- **Mixed marketplace example (`S07.marketplace-install`).** Network; `--install` writes to the run's install store (its `HOME` and `OH_PERSISTENCE_DIR` are private).
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk exec --expect-output "greeting-helper" -- python examples/05_skills_and_plugins/04_mixed_marketplace_skills/main.py
+  control-sdk exec --expect-output "greeting-helper" -- python examples/05_skills_and_plugins/04_mixed_marketplace_skills/main.py --install
+  ```
+- **The model picks `invoke_skill` (`S07.available-skills-prompt`, `S07.invoke-skill-run`).** Live, through the integration runner.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk exec --model-env -- python tests/integration/run_infer.py --llm-config '{"model": "deepseek/deepseek-flash"}' --eval-ids t09_invoke_skill
+  ```
 
 ## Gotchas
 
@@ -106,4 +206,6 @@ Preconditions:
 - `examples/05_skills_and_plugins/03_managing_installed_skills/main.py` is not in `_TARGET_DIRECTORIES` of `tests/examples/test_examples.py`, so the `test-examples` label never runs it.
 - `04_mixed_marketplace_skills/main.py --install` writes to the real user install store (no `installed_dir` override) and needs GitHub access; run it in a throwaway `HOME` or `OH_PERSISTENCE_DIR`.
 - Inline `` !`cmd` `` execution runs shell commands with full process privileges whenever a skill is rendered by `invoke_skill`; only load trusted skills.
+- The public-skills clone lives at the fixed path `<persistence>/cache/skills/public-skills` whatever `repo_url` is: after `load_public_skills(repo_url=<other repo>)`, a later default call (or `AgentContext(load_public_skills=True)`) in a new process updates that clone from its existing origin and returns the other repository's skills, not `OpenHands/extensions` (reproduced 2026-10-13 with `programs/S07/public.py`: `local` then `remote` in one run gives 3 skills and `origin` pointing at the local repo).
+- Marketplace files in the public repository list skills as `plugins` entries (`load_marketplace_skill_names` reads `marketplace.plugins`); a `skills` list there is ignored.
 - `tests/integration/run_infer.py` needs both `LLM_API_KEY` and `LLM_BASE_URL`; without either, the test instance raises `ValueError(... Skipping real LLM test.)` and is counted as an error, not a pass.

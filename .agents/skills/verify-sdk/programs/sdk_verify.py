@@ -83,8 +83,12 @@ def run_config() -> dict[str, Any]:
 
 
 def script_messages(script: list[dict[str, Any]]) -> list[Any]:
-    from openhands.sdk.llm import Message, MessageToolCall, TextContent
-    from openhands.sdk.llm import exceptions as llm_errors
+    from openhands.sdk.llm import (
+        Message,
+        MessageToolCall,
+        TextContent,
+        exceptions as llm_errors,
+    )
 
     items: list[Any] = []
     for n, step in enumerate(script):
@@ -194,9 +198,7 @@ def conversation_dir(cid: str) -> Path:
     return run_paths()["conversations"] / cid.replace("-", "")
 
 
-def open_conversation(
-    record: dict[str, Any], *, llm: Any = None, **kwargs: Any
-) -> Any:
+def open_conversation(record: dict[str, Any], *, llm: Any = None, **kwargs: Any) -> Any:
     """Reopen a persisted conversation the way a program resumes one."""
     import uuid
 

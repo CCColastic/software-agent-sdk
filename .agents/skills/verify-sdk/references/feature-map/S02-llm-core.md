@@ -50,75 +50,216 @@ Examples: `examples/01_standalone_sdk/13_get_llm_metrics.py`, `examples/01_stand
 ## Driving it
 
 Preconditions:
-- `uv sync --dev` has run.
-- For example bullets: `LLM_API_KEY` exported, optionally `LLM_MODEL` and `LLM_BASE_URL`; `tmux` installed (examples use the terminal tool); network access.
+- `uv sync --dev` has run; `control-sdk` is on `PATH` (`export PATH="$PWD/.agents/skills/verify-sdk/scripts:$PATH"`). `sdk-map run` does both.
+- `tmux` on `PATH` (the agent runs use `TerminalTool`).
+- Live bullets: `DEEPSEEK_API_KEY` exported.
 
-- **Completion and API mode (`S02.completion`, `S02.api-mode`, `S02.native-tool-calling`).** Mocked LiteLLM proof, then a real call.
+The scripted bullets point a real `LLM` (`openai/...`, `anthropic/...`) at `programs/S02/fake_provider.py`, a local endpoint that answers Chat Completions, Responses and Anthropic Messages requests from a script. `TestLLM` would bypass LiteLLM; this way the SDK's own request building, parsing, streaming, retries, error mapping, metrics and logs run, and the program reports what reached the wire.
+
+- **An agent run through the provider path (`S02.completion`, `S02.native-tool-calling`, `S02.metrics`, `S02.pricing-override`, `S02.log-completions`, `S02.reasoning-content`, `S02.api-mode`).** A priced `openai/gpt-4o-mini` with custom sampling params, headers, extra body and completion logging runs a two-step task (a terminal call with `reasoning_content`, then `finish`).
   ```sh
-  uv run pytest tests/sdk/llm/test_llm_completion.py tests/sdk/llm/test_llm.py tests/sdk/llm/test_llm_litellm_extra_body.py -q
-  uv run python examples/01_standalone_sdk/13_get_llm_metrics.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S02/provider_run --arg chat \
+    --check execution_status eq finished --check actions.0 eq terminal --check actions.1 eq finish \
+    --check observation_text contains provider-run --check paths.0 eq /v1/chat/completions \
+    --check uses_responses_api eq false --check request_tools contains terminal --check request_tools contains finish \
+    --check sent.temperature eq 0.3 --check sent.top_p eq 0.9 --check sent.max_completion_tokens eq 123 \
+    --check sent.seed eq 7 --check sent.verify_extra eq yes --check header_forwarded eq true \
+    --check accumulated_cost eq 0.28 --check costs eq 2 --check token_usages eq 2 \
+    --check response_latencies eq 2 --check prompt_tokens eq 200 --check log_files eq 2 \
+    --check reasoning_content_on_action eq "think about echo"
   ```
-  The tests pass; the example runs a short task and prints `llm.metrics` and `EXAMPLE_COST: <float>`.
-- **Streaming and timeouts (`S02.streaming`, `S02.stream-no-callback`, `S02.timeouts`).**
+  Native tool calling sends `terminal`, `finish` and `think` as provider tool definitions; two calls at 100 prompt and 20 completion tokens, priced at 0.001 and 0.002 per token, cost exactly 0.28 (the `input_cost_per_token`/`output_cost_per_token` override); `log_completions` wrote one JSON file per call.
+- **Responses API and reasoning replay (`S02.api-mode`, `S02.responses-reasoning`).** `openai/gpt-5-mini` with `api_mode="responses"`, `reasoning_effort="low"` and `reasoning_summary="auto"`; the first reply carries a reasoning summary and encrypted content.
   ```sh
-  uv run pytest tests/sdk/llm/test_llm_completion.py::test_llm_completion_streaming_with_callback tests/sdk/llm/test_llm_completion.py::test_llm_streaming_without_callback_degrades tests/sdk/event/test_streaming.py tests/sdk/agent/test_stream_context.py tests/sdk/llm/test_llm_timeout.py -q
-  uv run python examples/01_standalone_sdk/29_llm_streaming.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S02/provider_run --arg responses \
+    --check execution_status eq finished --check paths.0 eq /v1/responses --check uses_responses_api eq true \
+    --check reasoning_sent.effort eq low --check reasoning_sent.summary eq auto \
+    --check include contains reasoning.encrypted_content --check first_body_keys contains prompt_cache_key \
+    --check action_reasoning_summary.0 eq "plan the echo" --check action_encrypted eq ENC-1 \
+    --check replayed_reasoning eq 1 --check replayed_encrypted.0 eq ENC-1
   ```
-  The tests pass; the example prints the story token by token with `THINKING:`, `CONTENT:`, `TOOL NAME:` and `TOOL ARGS:` prefixes as the stream switches kind.
-- **Responses reasoning (`S02.responses-reasoning`).**
+  The second request replays the reasoning item, encrypted content included.
+- **Streaming in an agent run and direct calls (`S02.streaming`, `S02.stream-no-callback`, `S02.reasoning-content`).** `LLM(stream=True)` with `Conversation(token_callbacks=[...])`, then direct sync and async calls.
   ```sh
-  uv run pytest tests/sdk/llm/test_responses_parsing_and_kwargs.py tests/sdk/llm/test_responses_serialization.py -q
-  uv run python examples/01_standalone_sdk/23_responses_reasoning.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S02/provider_run --arg stream \
+    --check execution_status eq finished --check stream_requested eq true --check chunks gt 10 \
+    --check delta_kinds contains content --check delta_kinds contains reasoning --check delta_kinds contains tool_call \
+    --check reasoning_content_on_action eq "think about echo" --check action_command eq "echo provider-run"
+  control-sdk program S02/llm_calls --arg streaming \
+    --check no_callback.text eq "plain reply" --check no_callback.stream_sent missing \
+    --check async_callback.text eq "async streamed reply" --check async_callback.chunks gt 3 \
+    --check async_callback.cache_read_tokens eq 40 \
+    --check sync_callback.text eq "sync streamed reply" --check sync_callback.tool_calls.0 eq lookup \
+    --check sync_callback.tool_arguments.0 eq '{"q": 1}'
   ```
-  The tests pass; the example runs a conversation on `openhands/gpt-5-mini-2025-08-07` with `reasoning_effort="high"` and prints the LLM messages including reasoning.
-- **Anthropic thinking and reasoning content (`S02.anthropic-thinking`, `S02.reasoning-content`, `S02.reasoning-options`).**
+  Content, reasoning and tool-call deltas reach the callback and the final message is reassembled (tool arguments and cache-read tokens included); `stream=True` without a callback sends a plain request and returns the full reply.
+- **Timeouts (`S02.timeouts`).** A reply slower than `timeout=1`, a stream that stalls longer than `stream_idle_timeout=1` on `acompletion`, and the same stall inside `await conversation.arun()`.
   ```sh
-  uv run pytest tests/sdk/llm/test_thinking_blocks.py tests/sdk/llm/test_reasoning_content.py tests/sdk/llm/test_chat_options.py tests/sdk/llm/test_joint_budget_clamp.py -q
-  LLM_MODEL=anthropic/claude-sonnet-4-5-20250929 uv run python examples/01_standalone_sdk/22_anthropic_thinking.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S02/llm_calls --arg timeouts \
+    --check timeout.error eq LLMTimeoutError --check timeout.seconds lt 3 \
+    --check stream_idle.error eq LLMTimeoutError --check stream_idle.seconds lt 3 \
+    --check conversation.status eq error --check conversation.error_events.0 eq LLMTimeoutError
   ```
-  The tests pass; the example prints `Found N thinking blocks` with their text for each assistant turn.
-- **Model features (`S02.model-features`).**
+- **Anthropic thinking (`S02.anthropic-thinking`, `S02.prompt-caching`).** `anthropic/claude-sonnet-4-5-20250929` with `extended_thinking_budget=200000` and `max_output_tokens=4096`; the first reply carries a signed thinking block.
   ```sh
-  uv run pytest tests/sdk/llm/test_model_features.py tests/sdk/llm/test_model_info_proxy_lookup.py tests/sdk/llm/test_model_canonical_name_resolution.py -q
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S02/provider_run --arg anthropic \
+    --check execution_status eq finished --check paths.0 eq /v1/messages \
+    --check thinking_param.type eq enabled --check thinking_param.budget_tokens eq 4095 --check max_tokens eq 4096 \
+    --check anthropic_beta contains interleaved-thinking --check action_thinking_blocks eq 1 \
+    --check thinking_sent_back.0 eq sig-1 --check cache_control_markers eq 2
   ```
-  The tests pass.
-- **Prompted tool calling (`S02.prompted-tool-calling`).**
+  The budget is clamped below `max_tokens`, the thinking block lands on the `ActionEvent` and goes back unchanged (signature included) on the next turn, and the system prompt and last user turn carry cache markers.
+- **Reasoning options and model features (`S02.reasoning-options`, `S02.model-features`).** The feature table for several models, and the chat parameters each model's request actually carried.
   ```sh
-  uv run pytest tests/sdk/llm/test_llm_fncall_converter.py tests/sdk/llm/test_llm_completion.py::test_llm_completion_non_function_call_mode -q
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S02/llm_calls --arg features \
+    --check features.openai/gpt-5-mini.reasoning_effort eq true --check features.openai/gpt-5-mini.responses_api eq true \
+    --check features.openai/gpt-4o-mini.reasoning_effort eq false \
+    --check features.anthropic/claude-sonnet-4-5-20250929.thinking_mode eq manual \
+    --check features.anthropic/claude-sonnet-4-5-20250929.prompt_cache eq true \
+    --check features.deepseek/deepseek-chat.vision eq false --check proxy_prefix_stripped eq true \
+    --check sent.gpt5.reasoning_effort eq high --check sent.gpt5.temperature missing --check sent.gpt5.top_p missing \
+    --check sent.gpt4o.reasoning_effort missing --check sent.gpt4o.temperature eq 0.5 --check sent.gpt4o.top_p eq 0.9 \
+    --check sent.azure.max_tokens eq true --check sent.azure.max_completion_tokens eq false \
+    --check sent.openrouter.openrouter_headers eq true
   ```
-  The tests pass: tool schemas go into the prompt and text replies come back as tool calls.
-- **Metrics and costs (`S02.metrics`, `S02.conversation-stats`, `S02.pricing-override`).**
+  A reasoning model gets `reasoning_effort` (default `high`) and loses `temperature`/`top_p`; a non-reasoning model keeps them; Azure gets `max_tokens`. (Prompt-cache keys show in the Responses bullet above.)
+- **Prompted tool calling (`S02.prompted-tool-calling`, `S02.native-tool-calling`).** `native_tool_calling=False`: the agent's tools are described in the prompt and the model's `<function=...>` text becomes real tool calls.
   ```sh
-  uv run pytest tests/sdk/llm/test_llm_metrics.py tests/sdk/conversation/test_conversation_stats.py tests/sdk/llm/test_llm_pricing_passthrough.py tests/sdk/llm/test_llm_span_cost.py -q
-  uv run python examples/01_standalone_sdk/21_generate_extraneous_conversation_costs.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S02/provider_run --arg prompted \
+    --check execution_status eq finished --check actions.0 eq terminal --check actions.1 eq finish \
+    --check observation_text contains provider-run --check tools_param_sent eq false \
+    --check prompt_describes_terminal eq true --check prompt_has_call_format eq true
+  control-sdk program S02/llm_calls --arg prompted \
+    --check tools_param_sent eq false --check parsed.valid.tool_calls.0.0 eq finish \
+    --check parsed.valid.tool_calls.0.1.message eq bye \
+    --check parsed.unknown_tool.error eq FunctionCallValidationError \
+    --check parsed.unknown_parameter.error eq FunctionCallValidationError
   ```
-  The tests pass; the example prints combined cost and tokens and a table with separate rows for `agent`, `condenser` (if it ran) and `demo-secondary`.
-- **Retries and error mapping (`S02.retries`, `S02.no-response-retry`, `S02.error-mapping`).**
+- **Retries (`S02.retries`).** A 429 then a 503 then success; a 400; a 429 that never clears; a budget denial.
   ```sh
-  uv run pytest tests/sdk/llm/test_api_connection_error_retry.py tests/sdk/llm/test_llm_no_response_retry.py tests/sdk/llm/test_llm_retry_telemetry.py tests/sdk/llm/test_auth_refresh_retry.py tests/sdk/llm/test_exception_mapping.py tests/sdk/llm/test_exception_classifier.py tests/sdk/llm/test_exception.py tests/sdk/llm/test_budget_denial_http.py -q
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S02/llm_calls --arg retries \
+    --check transient.text eq hi --check transient.requests eq 3 --check transient.listener len-eq 2 \
+    --check non_retryable.error eq LLMBadRequestError --check non_retryable.requests eq 1 \
+    --check exhausted.error eq LLMRateLimitError --check exhausted.requests eq 3 \
+    --check budget_denial.requests eq 1
   ```
-  The tests pass.
-- **Caching, tokens, context guard (`S02.prompt-caching`, `S02.token-count`, `S02.context-window-guard`).**
+  `num_retries=3` means three attempts in all; the retry listener sees each retry; a bad request and a budget denial are not retried.
+- **No-response retry (`S02.no-response-retry`).** Empty replies on the chat path (a reply with no `choices`) and on the Responses path (a stream that ends without its completed event), with `temperature=0`.
   ```sh
-  uv run pytest tests/sdk/llm/test_prompt_caching_cross_conversation.py tests/sdk/llm/test_llm.py::test_llm_token_counting tests/sdk/llm/test_llm.py::test_llm_raises_error_on_small_context_window tests/sdk/llm/test_llm.py::test_llm_respects_allow_short_context_windows_env_var -q
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S02/llm_calls --arg no-response \
+    --check responses.text eq hi --check responses.requests eq 2 --check responses.temperatures.1 eq 1.0 \
+    --check responses_async_exhausted.error eq LLMNoResponseError --check responses_async_exhausted.requests eq 2 \
+    --check chat.text eq hi --check chat.temperatures.1 eq 1.0 \
+    --check chat_exhausted.error eq LLMNoResponseError
   ```
-  The tests pass.
-- **Message formatting from persisted events (`S02.message-formatting`).**
+  Known failure (reproduced 2026-10-13, not yet filed): the Responses path behaves as documented, but on the chat path a provider reply with `"choices": []` never reaches the SDK's `LLMNoResponseError` check. LiteLLM raises `InternalServerError: ... provider returned a response with no 'choices'` first, the SDK maps that to `LLMServiceUnavailableError`, and retries it as a transient error without the temperature bump (`chat.temperatures` is `[0.0, 0.0, 0.0]`; `chat_exhausted.error` is `LLMServiceUnavailableError`). The unit tests mock `litellm_completion` to return the empty response, so they never meet LiteLLM's own check.
+- **Error mapping (`S02.error-mapping`).** Each provider error body, as an OpenAI-compatible endpoint sends it, and a dead endpoint.
   ```sh
-  uv run pytest tests/sdk/event/test_events_to_messages.py tests/sdk/llm/test_message.py tests/sdk/llm/test_message_serialization.py -q
-  uv run python examples/01_standalone_sdk/36_event_json_to_openai_messages.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S02/llm_calls --arg errors \
+    --check mapped.context_window eq LLMContextWindowExceedError \
+    --check mapped.malformed_history eq LLMMalformedConversationHistoryError \
+    --check mapped.auth_401_incorrect_key eq LLMAuthenticationError --check mapped.auth_401_invalid_key eq LLMAuthenticationError \
+    --check mapped.rate_limit eq LLMRateLimitError --check mapped.service_unavailable eq LLMServiceUnavailableError \
+    --check mapped.bad_request eq LLMBadRequestError --check mapped.content_policy eq LLMContentPolicyViolationError \
+    --check mapped.timeout eq LLMTimeoutError --check mapped.connection_refused eq LLMServiceUnavailableError
   ```
-  The tests pass; the example reloads `.conversations/<id>/events/event-*.json` and prints the Chat Completions (or Responses) payload built from them.
-- **Image inlining, completion logs, serialization, env loading (`S02.image-inline`, `S02.log-completions`, `S02.serialization`).**
+- **Prompt caching (`S02.prompt-caching`).** An Anthropic model whose first request is rejected as too small to cache.
   ```sh
-  uv run pytest tests/sdk/llm/test_image_inline.py tests/sdk/llm/test_llm_log_completions_integration.py tests/sdk/llm/test_llm_serialization.py tests/sdk/test_settings.py::test_llm_load_from_env_rehydrates_subscription_runtime -q
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S02/llm_calls --arg cache-too-small \
+    --check caching_active eq true --check text eq uncached --check requests eq 2 \
+    --check cache_markers.0 eq 2 --check cache_markers.1 eq 0 --check caching_off_markers eq 0
   ```
-  The tests pass.
-- **Provider compliance and thinking with a real model (`S02.error-mapping`, `S02.anthropic-thinking`).** Needs a model key.
+- **Token counting and the context-window guard (`S02.token-count`, `S02.context-window-guard`).**
   ```sh
-  uv run python tests/integration/run_infer.py --llm-config '{"model": "litellm_proxy/anthropic/claude-opus-4-5", "extended_thinking": true}' --test-type condenser --eval-ids c01_thinking_block_condenser
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S02/llm_calls --arg token-count --check plain gt 5 --check with_tools gt 100 --check longer gt 200
+  control-sdk program S02/llm_calls --arg context-guard \
+    --check short_window_error eq LLMContextWindowTooSmallError --check configured_max_output missing \
+    --check fallback_max_output eq 16384
+  control-sdk program S02/llm_calls --arg context-guard --env ALLOW_SHORT_CONTEXT_WINDOWS=true \
+    --check short_window_error missing
   ```
-  The task reports pass/fail in `tests/integration/outputs/`.
+  `max_input_tokens=1000` is refused unless `ALLOW_SHORT_CONTEXT_WINDOWS` is set; a model registered with only `max_tokens=200000` gets the 16384 output cap.
+- **Messages from saved events (`S02.message-formatting`).** A scripted conversation's saved event files, reloaded and formatted for each payload shape.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  CID=$(control-sdk conversation new --script S01/echo_parallel_finish.json --field id)
+  control-sdk conversation send "$CID" --text "Write greeting.txt" --run --check execution_status eq finished
+  control-sdk program S02/format_messages --arg "$CID" \
+    --check event_files eq 10 --check chat_roles.0 eq system --check chat_has_tool_messages eq true \
+    --check chat_list_content eq true --check string_content_text_turns eq true --check string_content_image_turn eq list \
+    --check vision_image_sent eq true --check no_vision_image_sent eq false \
+    --check anthropic_cache_markers eq 2 --check openai_cache_markers eq 0 \
+    --check responses_instructions eq true --check responses_item_types contains function_call_output
+  ```
+  `force_string_serializer=True` turns every text turn into a plain string but keeps the list form for the turn with an image (a string would drop it).
+- **Inline images (`S02.image-inline`).** An image URL served by the local endpoint, with `inline_image_urls=True` and `False`; private hosts are refused unless `OH_INLINE_IMAGE_ALLOW_PRIVATE_HOSTS=1`.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S02/llm_calls --arg inline-image --env OH_INLINE_IMAGE_ALLOW_PRIVATE_HOSTS=1 \
+    --check inline.image_urls.0 matches '^data:image/png' --check inline.image_urls.0 contains base64 --check as_url.image_urls.0 matches '^http://'
+  control-sdk program S02/llm_calls --arg inline-image \
+    --check inline.error missing --check inline.image_urls.0 matches '^http://'
+  ```
+- **Serialization and env loading (`S02.serialization`).**
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S02/llm_calls --arg serialization \
+    --env LLM_MODEL=openai/gpt-4o-mini --env LLM_API_KEY=sk-env --env LLM_NUM_RETRIES=2 \
+    --env LLM_TEMPERATURE=0.25 --env LLM_NATIVE_TOOL_CALLING=false \
+    --check api_key_dumped eq "**********" --check secret_in_json eq false --check exposed_key eq true \
+    --check roundtrip_model eq openai/gpt-4o-mini --check roundtrip_temperature eq 0.2 \
+    --check copy_temperature eq 0.7 --check copy_keeps_model eq true --check copy_keeps_key eq true \
+    --check env.model eq openai/gpt-4o-mini --check env.num_retries eq 2 --check env.temperature eq 0.25 \
+    --check env.native_tool_calling eq false --check env.key_set eq true
+  ```
+- **Conversation stats (`S02.conversation-stats`, `S02.metrics`).** A persisted priced conversation, a second LLM added to `conversation.llm_registry` after the run (as example 21 does), then a resume.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S02/conversation_stats \
+    --check first_run.usage_ids contains secondary --check first_run.agent_cost eq 0.28 \
+    --check first_run.secondary_cost eq 0.14 --check first_run.combined_cost eq 0.42 \
+    --check first_run.combined_prompt_tokens eq 300 \
+    --check resumed.restored_agent_cost eq 0.28 --check resumed.agent_cost_after eq 0.42 \
+    --check resumed.agent_calls_after eq 3 --check resumed.status eq finished
+  ```
+- **The same calls, live (`S02.completion`, `S02.streaming`, `S02.metrics`, `S02.api-mode`).**
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk program S02/live_llm \
+    --check completion_text ne "" --check streamed_text ne "" --check stream_chunks gt 1 \
+    --check generate_text ne "" --check calls_recorded eq 2 --check prompt_tokens gt 0 --check latencies eq 2
+  CID=$(control-sdk conversation new --field id)
+  control-sdk conversation send "$CID" --run \
+    --text "Use the terminal to run: echo live-ok > live.txt. Then finish." \
+    --check execution_status eq finished
+  control-sdk exec --expect-output live-ok -- cat live.txt
+  ```
+- **Examples 13, 21, 29 and 36 (`S02.metrics`, `S02.conversation-stats`, `S02.streaming`, `S02.message-formatting`).** Live.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk exec --model-env --expect-output EXAMPLE_COST -- python examples/01_standalone_sdk/13_get_llm_metrics.py
+  control-sdk exec --model-env --expect-output demo-secondary -- python examples/01_standalone_sdk/21_generate_extraneous_conversation_costs.py
+  control-sdk exec --model-env --expect-output EXAMPLE_COST -- python examples/01_standalone_sdk/29_llm_streaming.py
+  control-sdk exec --model-env -- python examples/01_standalone_sdk/36_event_json_to_openai_messages.py
+  ```
+- **API compliance of a real provider (`S02.error-mapping`).** Live, through the integration runner.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk exec --model-env -- python tests/integration/run_infer.py --llm-config '{"model": "deepseek/deepseek-flash"}' --eval-ids a01_unmatched_tool_use
+  ```
+- **Examples 22 and 23 and the thinking-block condenser test (`S02.anthropic-thinking`, `S02.responses-reasoning`), blocked.** Example 22 and `c01_thinking_block_condenser` need an Anthropic extended-thinking model and key; example 23 hardcodes `openhands/gpt-5-mini-2025-08-07` and needs an OpenHands provider key. The run's DeepSeek key reaches neither.
 
 ## Gotchas
 
@@ -130,4 +271,8 @@ Preconditions:
 - `num_retries=5` with `retry_min_wait=8` and `retry_max_wait=64` means a dead endpoint can block for minutes before raising; lower them in tests.
 - `LLM.load_from_env` has no general unit test; the only test covers the subscription rehydration case.
 - Cost is 0 and LiteLLM warns `Cost calculation failed` for models it has no pricing for (seen in test output); set `input_cost_per_token`/`output_cost_per_token` for proxies.
-- All pytest commands above passed on 4cc0582 (781 tests in the combined LLM set).
+- `openrouter_site_url`/`openrouter_app_name` have defaults, so `HTTP-Referer` and `X-Title` headers go to every provider, not only OpenRouter.
+- `num_retries` is the total number of attempts, not extra retries; the temperature bump on an empty response applies only when the temperature is exactly 0.
+- LiteLLM picks the exception class from the error body's `type`, not only the HTTP status: a 503 or 401 whose body says `invalid_request_error` surfaces as a bad-request error. Fake servers must set a type that matches the status.
+- A chat reply with `"choices": []` is raised by LiteLLM as `InternalServerError` (no 'choices'), so the SDK treats it as a service error, not as an empty response, and does not bump the temperature.
+- Inline images from `localhost`/private addresses are refused unless `OH_INLINE_IMAGE_ALLOW_PRIVATE_HOSTS=1`; `force_string_serializer` keeps the list form for turns that carry an image.

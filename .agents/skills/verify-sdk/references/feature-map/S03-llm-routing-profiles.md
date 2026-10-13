@@ -49,58 +49,195 @@ Examples: `examples/01_standalone_sdk/05_use_llm_registry.py`, `examples/01_stan
 ## Driving it
 
 Preconditions:
-- `uv sync --dev` has run.
-- For example bullets: `LLM_API_KEY` exported, optionally `LLM_MODEL` and `LLM_BASE_URL`; examples 49 and 59 default `LLM_BASE_URL` to `https://llm-proxy.app.all-hands.dev` and need a key valid there; `tmux` installed; network access.
+- `uv sync --dev` has run; `control-sdk` is on `PATH` (`export PATH="$PWD/.agents/skills/verify-sdk/scripts:$PATH"`). `sdk-map run` does both.
+- `tmux` on `PATH` (some conversations carry `TerminalTool`).
+- Live bullets: `DEEPSEEK_API_KEY` exported.
 
-- **Registry and stats wiring (`S03.registry-crud`, `S03.registry-independent-metrics`, `S03.registry-stats-wiring`, `S03.agent-llm-discovery`).**
+Every model in the scripted bullets is a real `LLM` answering from its own local endpoint (`programs/S02/fake_provider.py`), so the programs can tell which model served each call and what it cost. Profiles go to the run's private `$OH_PERSISTENCE_DIR/profiles`, never the caller's `~/.openhands`.
+
+- **The registry (`S03.registry-crud`, `S03.registry-independent-metrics`, `S03.registry-stats-wiring`).** Add, get, duplicate, remove; a copied LLM's metrics; a pre-spent LLM; a subscriber that raises.
   ```sh
-  uv run pytest tests/sdk/llm/test_llm_registry.py tests/sdk/conversation/test_conversation_stats.py tests/sdk/agent/test_agent_llms_are_discoverable.py -q
-  uv run python examples/01_standalone_sdk/05_use_llm_registry.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S03/routing --arg registry \
+    --check usage_ids.0 eq first --check usage_ids.1 eq copy --check same_instance eq true \
+    --check duplicate_error eq ValueError --check unique_registry_ids eq true \
+    --check first_cost eq 0.14 --check copy_cost eq 0 --check copy_metrics_independent eq true \
+    --check notified.1 eq copy --check after_remove len-eq 1 --check missing_error eq KeyError \
+    --check independent_keeps_metrics eq true \
+    --check failing_subscriber_add_error missing --check failing_subscriber_registered.0 eq n
   ```
-  The tests pass; the example prints `LLM Registry usage IDs: ['agent']` and `Same LLM instance: True`.
-- **Multimodal routing (`S03.multimodal-router-images`).**
+- **Stats follow the conversation's registry (`S03.registry-stats-wiring`).** A priced LLM added to `conversation.llm_registry` after the run (as example 21 does), and one added right after building the conversation, before the first message.
   ```sh
-  uv run pytest tests/sdk/agent/test_non_multimodal_image_input.py::test_image_input_guard_does_not_preempt_multimodal_router -q
-  LLM_ROUTING_SECONDARY_MODEL=<text-only model> uv run python examples/01_standalone_sdk/19_llm_routing.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S02/conversation_stats \
+    --check first_run.usage_ids contains secondary --check first_run.combined_cost eq 0.42
+  control-sdk program S02/conversation_stats --arg before-first-message \
+    --check first_run.secondary_in_registry eq true --check first_run.usage_ids contains secondary \
+    --check first_run.secondary_cost eq 0.14 --check first_run.combined_cost eq 0.42
   ```
-  The test passes; the example's log shows `Routing to the secondary model...` for the text turns and `Routing to the primary model...` for the image turn.
-- **Router text and token-limit routing, validation, random router, untested (`S03.multimodal-router-text`, `S03.router-validation`, `S03.random-router`).** Only example 19 touches the text path; nothing exercises validation or `RandomRouter`.
-- **Fallback (`S03.fallback-*`).**
+  Known failure (reproduced 2026-10-13, not yet filed): an LLM added to `conversation.llm_registry` before the first `send_message` never reaches `conversation_stats`. The conversation subscribes the stats to its registry only when it initializes the agent (on the first message), and `subscribe` does not replay LLMs already registered, so `secondary` sits in the registry while `usage_to_metrics` has only `agent`, and its 0.14 is missing from the combined cost (0.28).
+- **Every LLM the agent reaches is registered (`S03.agent-llm-discovery`).** An agent whose LLM is a `MultimodalRouter` and whose condenser has its own LLM; then an agent and condenser that share a `usage_id`.
   ```sh
-  uv run pytest tests/sdk/llm/test_llm_fallback.py -q
-  uv run python examples/01_standalone_sdk/39_llm_fallback.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S03/routing --arg discovery \
+    --check status eq finished --check before_first_message len-eq 0 \
+    --check registered contains router-primary --check registered contains router-secondary \
+    --check registered contains condenser --check stats contains router-secondary \
+    --check duplicate_usage_ids.error missing --check duplicate_usage_ids.registered len-eq 1
   ```
-  49 tests pass; the example writes `HAIKU.txt` and prints the total cost and one token-usage line per LLM call with its model (all on the primary unless it failed over).
-- **Profile store (`S03.profile-*`, `S03.provider-connections`).** The example makes no model call.
+  Registration happens on the first message; the router's children and the condenser's LLM each get a slot (the router itself does not).
+- **Multimodal routing in an agent run (`S03.multimodal-router-images`, `S03.multimodal-router-text`).** Primary `openai/gpt-4o-mini`, secondary `deepseek/deepseek-chat` (no vision, `max_input_tokens=20000`): a short text turn, an image turn, a 30000-word turn.
   ```sh
-  uv run pytest tests/sdk/llm/test_llm_profile_store.py tests/sdk/llm/test_provider_connection_store.py -q
-  uv run python examples/01_standalone_sdk/37_llm_profile_store/main.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S03/routing --arg multimodal \
+    --check served.0 eq secondary --check served.1 eq primary --check served.2 eq primary \
+    --check secondary_vision eq false \
+    --check agent_replies.0 eq "secondary: short answer" --check agent_replies.1 eq "primary: image answer" \
+    --check agent_replies.2 eq "primary: long answer"
   ```
-  The tests pass; the example prints `Seeded profiles: ['fast.json']`, then both profiles, the loaded `fast` and `creative` settings, and `EXAMPLE_COST: 0`.
-- **Switching in a conversation (`S03.switch-profile`, `S03.switch-llm-object`).**
+  The image turn reaches the primary model instead of the agent's "cannot see images" reply, so the non-vision guard does not pre-empt the router.
+- **Router validation and `RandomRouter` (`S03.router-validation`, `S03.random-router`).**
   ```sh
-  uv run pytest tests/sdk/conversation/test_switch_model.py tests/sdk/conversation/test_ask_agent.py::test_ask_agent_llm_refreshes_after_switch_llm -q
-  uv run python examples/01_standalone_sdk/44_model_switching_in_convo.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S03/routing --arg validation \
+    --check errors.missing_secondary eq ValidationError --check errors.missing_primary eq ValidationError \
+    --check errors.empty_random eq ValidationError --check errors.valid missing
+  control-sdk program S03/routing --arg random --check calls eq 20 --check from_a gt 0 --check from_b gt 0
   ```
-  The tests pass; the example prints `Switched to: openhands/gpt-5.2` and one cost line per usage id.
-- **switch_llm tool (`S03.switch-llm-tool`).**
+- **Fallback (`S03.fallback-transient`, `S03.fallback-skip`, `S03.fallback-metrics`, `S03.fallback-profile-resolution`).** A rate-limited primary with two fallback profiles (the first also rate-limited; the second saved after the primary was built), then a bad request, a budget denial, quota exhaustion, every model failing, the Responses path and `acompletion`.
   ```sh
-  uv run pytest tests/sdk/tool/test_switch_llm.py -q
-  uv run python examples/01_standalone_sdk/49_switch_llm_tool.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S03/routing --arg fallback \
+    --check transient.text eq "from fallback 2" --check transient.fallback1_requests eq 1 \
+    --check transient.fallback2_requests eq 1 --check transient.primary_cost eq 0.14 \
+    --check next_call.text eq "primary again" --check next_call.primary_requests eq 2 \
+    --check non_transient.error eq LLMBadRequestError --check non_transient.fallback_requests eq 0 \
+    --check budget_denial.fallback_requests eq 0 \
+    --check quota.text eq "from quota fallback" --check quota.primary_requests eq 1 \
+    --check all_fail.error eq LLMRateLimitError --check all_fail.fallback_requests eq 1 \
+    --check responses.text eq "responses fallback" --check responses.paths.0 eq /v1/responses \
+    --check async.text eq "async fallback"
   ```
-  The tests pass; the example prints `Active model after tool switch: openai/prod/claude-sonnet-4-5-20250929` and asserts it.
-- **route_task_to_model and meta-profiles (`S03.route-task-to-model`, `S03.meta-profile-store`).**
+  The fallback's cost lands in the primary's metrics (0.14); quota exhaustion fails over on the first attempt although the primary allows three.
+- **The profile store (`S03.profile-save-load`, `S03.profile-secrets`, `S03.profile-concurrency-limits`, `S03.profile-migration`).**
   ```sh
-  uv run pytest tests/sdk/tool/test_classify_and_switch_llm.py tests/sdk/llm/test_meta_profile_store.py -q
-  uv run python examples/01_standalone_sdk/59_route_task_to_model.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S03/profiles --arg crud \
+    --check files len-eq 2 --check tmp_leftovers eq 0 --check schema_version eq 1 \
+    --check loaded_model eq openai/gpt-4o-mini --check loaded_temperature eq 0.1 --check summaries len-eq 2 \
+    --check after_rename contains bold.json --check after_delete len-eq 1 \
+    --check invalid_name contains "Invalid profile name" --check missing contains "Available profiles: fast" \
+    --check corrupted contains "Failed to load profile"
+  control-sdk program S03/profiles --arg secrets \
+    --check masked_has_secret eq false --check masked_loaded_key missing \
+    --check plain_has_secret eq true --check plain_loaded_key eq sk-profile-secret \
+    --check encrypted_has_secret eq false --check encrypted_loaded_key eq sk-profile-secret \
+    --check summaries.plain eq true --check summaries.masked eq false --check summaries_expose_secret eq false
+  control-sdk program S03/profiles --arg concurrency \
+    --check errors len-eq 0 --check reads_ok eq true --check profiles len-eq 5 --check tmp_leftovers eq 0 \
+    --check over_limit_is_profile_limit eq true --check overwrite_error missing --check limited_profiles len-eq 2
+  control-sdk program S03/profiles --arg migration \
+    --check legacy_model eq openhands/claude-opus-5 --check legacy_base_url missing \
+    --check thirdparty_model eq litellm_proxy/claude-opus-5 --check thirdparty_base_url eq https://litellm.example.com/ \
+    --check future_error contains "newer than supported"
   ```
-  The tests pass; the example prints the starting model, the model after routing, and per-usage costs including the classifier's.
-- **Subscription login, blocked for the example (`S03.subscription-login`, `S03.subscription-requests`).** The unit tests run offline; the example needs a ChatGPT Plus/Pro account and an interactive browser or device-code login.
+- **Provider connections (`S03.provider-connections`).** A profile that names a saved connection; the connection's key is rotated, then deleted.
   ```sh
-  uv run pytest tests/sdk/llm/auth/ tests/sdk/llm/test_subscription_mode.py tests/sdk/test_settings.py::test_llm_load_from_env_rehydrates_subscription_runtime -q
-  OPENHANDS_SUBSCRIPTION_MODEL=gpt-5.5 OPENHANDS_SUBSCRIPTION_AUTH_METHOD=device_code SUBSCRIPTION_LOGIN_ONLY=1 uv run python examples/01_standalone_sdk/35_subscription_login.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S03/profiles --arg connections \
+    --check stored_api_key missing --check stored_connection_id eq conn1 \
+    --check loaded_key eq sk-shared-connection --check loaded_base_url eq https://anthropic.example.com \
+    --check rotated_key eq sk-rotated --check dangling_error contains ProviderConnectionNotFound \
+    --check sibling_dir_default eq true
   ```
-  The tests pass; the example prints a verification URL and code, and after login prints `Using subscription mode: True`, the model, and `Login verified; skipping agent run because SUBSCRIPTION_LOGIN_ONLY=1.`
+- **Switching by profile (`S03.switch-profile`).** A persisted conversation on model A switches to the saved profile `model-b`.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S03/switching --arg profile \
+    --check requests.a eq 1 --check requests.b eq 1 --check active_model eq openai/gpt-4.1-mini \
+    --check registry contains profile:model-b --check stats.agent eq 0.14 --check stats.profile:model-b eq 0.14 \
+    --check persisted_model eq openai/gpt-4.1-mini --check missing_profile_error eq FileNotFoundError \
+    --check model_after_missing eq openai/gpt-4.1-mini --check prompt_cache_key_kept eq true \
+    --check prompt_cache_key_is_conversation_id eq true --check status eq finished
+  ```
+- **Switching to an LLM object (`S03.switch-llm-object`).** `switch_llm` with a new `usage_id`, `ask_agent` after it, a second object under the same `usage_id`, and two condenser setups.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S03/switching --arg llm-object \
+    --check requests.a eq 1 --check requests.b eq 2 --check requests.c eq 0 \
+    --check profile_store_untouched eq true --check side_answer eq "B answers the side question" \
+    --check model_after_reswitch eq openai/gpt-4.1-mini \
+    --check condenser_model eq openai/gpt-4.1-mini --check condenser_base_url_is_b eq true \
+    --check independent_condenser_model eq anthropic/claude-sonnet-4-5-20250929
+  ```
+- **The `switch_llm` tool (`S03.switch-llm-tool`).** The model asks for a missing profile, then for `model-b`; `filter_tools_regex="^(finish|terminal)$"` is set; once with `run()` and once with `arun()`.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S03/switching --arg tool \
+    --check status eq finished --check active_model eq openai/gpt-4.1-mini \
+    --check requests.a eq 2 --check requests.b eq 1 --check tools_sent contains switch_llm \
+    --check description_lists_profile eq true \
+    --check observations.0.error eq true --check observations.0.text contains "'missing-profile' was not found" \
+    --check observations.1.error eq false --check observations.2.text eq "finished on B"
+  control-sdk program S03/switching --arg tool-async \
+    --check status eq finished --check active_model eq openai/gpt-4.1-mini --check requests.b eq 1
+  ```
+- **`route_task_to_model` (`S03.route-task-to-model`).** `OpenHandsAgentSettings(enable_classify_and_switch_llm_tool=True, meta_profile=...)`: structured classes (the classifier answers `2`), a direct prompt template (it answers `{"model": "cheap"}`), an answer out of range, and a missing classifier profile.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S03/switching --arg route \
+    --check status eq finished --check active_model eq openai/gpt-4.1 \
+    --check requests.classifier eq 1 --check requests.strong eq 1 --check requests.cheap eq 0 \
+    --check classifier_saw_task eq true --check stats contains classifier:classifier \
+    --check observations.0.text contains "switched to LLM profile 'strong'" \
+    --check bad_class.error eq true --check bad_class.text contains "did not pick a valid category" \
+    --check missing_classifier.error eq true --check missing_classifier.text contains "no-classifier"
+  control-sdk program S03/switching --arg route-direct \
+    --check status eq finished --check active_model eq openai/gpt-4.1-nano --check requests.cheap eq 1 \
+    --check stats contains classifier:classifier --check bad_class.error eq true
+  ```
+- **Meta-profiles (`S03.meta-profile-store`).**
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S03/profiles --arg meta \
+    --check list len-eq 2 --check loaded_classes.1 eq strong --check loaded_template eq true \
+    --check after_delete len-eq 1 --check template_without_instance_text contains "instance_text" \
+    --check template_and_classes contains "cannot also define classes" --check over_limit contains "limit reached"
+  control-sdk program S03/profiles --arg default-dir \
+    --check profile_dir matches '/openhands/profiles$' --check meta_profile_dir matches '/openhands/meta-profiles$'
+  ```
+- **Subscription access without a fresh login (`S03.subscription-login`, `S03.subscription-requests`).** Cached, unexpired credentials in `$OH_PERSISTENCE_DIR/auth`; the returned LLM's requests go to a local Responses endpoint.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S03/subscription \
+    --check login_error missing --check is_subscription eq true --check model eq openai/gpt-5.5 \
+    --check base_url eq https://chatgpt.com/backend-api/codex --check stream eq true \
+    --check unsupported_model_error contains "not supported for subscription access" \
+    --check forced_login_error contains "consent has not been previously acknowledged" \
+    --check requests.text eq "codex reply" --check requests.count eq 2 \
+    --check requests.omitted_everywhere len-eq 5 --check requests.store eq false \
+    --check requests.authorization_uses_cached_token eq true --check requests.originator eq codex_cli_rs \
+    --check serialized.is_subscription eq true --check serialized.token_in_dump eq false \
+    --check from_env.is_subscription eq true --check from_env.model eq openai/gpt-5.5
+  ```
+  `temperature`, `max_output_tokens`, `include`, `reasoning` and `prompt_cache_retention` stay off every request, the retry after a 429 included.
+- **Switching models live (`S03.switch-profile`, `S03.registry-stats-wiring`).** Live: DeepSeek flash, then the `deepseek-pro` profile.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk program S03/live_switch \
+    --check first_model eq deepseek/deepseek-flash --check second_model eq deepseek/deepseek-v4-pro \
+    --check status eq finished --check usage_ids contains profile:pro --check calls.agent ge 1 --check calls.profile:pro ge 1
+  ```
+- **Examples 05, 37 and 39 (`S03.registry-crud`, `S03.profile-save-load`, `S03.fallback-transient`).** Live (37 makes no model call but runs with the others).
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk exec --model-env --expect-output "Same LLM instance: True" -- python examples/01_standalone_sdk/05_use_llm_registry.py
+  control-sdk exec --model-env --expect-output "EXAMPLE_COST: 0" -- python examples/01_standalone_sdk/37_llm_profile_store/main.py
+  control-sdk exec --model-env --env LLM_FALLBACK_MODEL_1=deepseek/deepseek-flash --env LLM_FALLBACK_MODEL_2=deepseek/deepseek-flash \
+    --expect-output "including fallbacks" -- python examples/01_standalone_sdk/39_llm_fallback.py
+  ```
+- **Examples 19, 44, 49 and 59 (`S03.multimodal-router-images`, `S03.switch-profile`, `S03.switch-llm-tool`, `S03.route-task-to-model`), blocked.** Example 19 sends an image to `LLM_MODEL` as the primary and needs a vision model; 44 saves an `openhands/gpt-5.2` profile and needs an OpenHands provider key; 49 and 59 hardcode `openai/gpt-5.5` and `openai/prod/claude-sonnet-4-5-20250929` behind `https://llm-proxy.app.all-hands.dev` and need a key for that proxy. The run's DeepSeek key reaches none of them.
+- **Interactive subscription login and example 35 (`S03.subscription-login`), blocked.** Needs a ChatGPT Plus/Pro account and an interactive browser or device-code login (`OPENHANDS_SUBSCRIPTION_MODEL=gpt-5.5 OPENHANDS_SUBSCRIPTION_AUTH_METHOD=device_code SUBSCRIPTION_LOGIN_ONLY=1 python examples/01_standalone_sdk/35_subscription_login.py`); token refresh needs the real OpenAI auth endpoint.
 
 ## Gotchas
 
@@ -111,4 +248,6 @@ Preconditions:
 - `19_llm_routing.py` defaults `LLM_ROUTING_SECONDARY_MODEL` to `LLM_MODEL`, so by default both routes hit the same model and the routing is visible only in logs.
 - Fallback only triggers after the primary's own retries are exhausted (`num_retries=5`, backoff up to 64 s), so forcing a fallback by pointing the primary at a dead endpoint is slow; lower `num_retries` and `retry_*_wait` on the primary.
 - `OH_PERSISTENCE_DIR` is read into module-level constants at import time; setting it after `import openhands.sdk` has no effect on the default profile directory.
-- All pytest commands above passed on 4cc0582 (318 tests in the combined set; a `RuntimeWarning: coroutine '_apply_acp_model' was never awaited` is printed by the switch-model tests and is harmless).
+- An LLM added to `conversation.llm_registry` before the first `send_message` is not tracked in `conversation_stats` (the stats subscribe to the registry when the agent is initialized, with no replay); add extra LLMs after the first message.
+- `LLMProfileStore.list()` returns file names with the `.json` suffix, while `load`/`delete`/`switch_profile` take the bare name.
+- `prompt_cache_key` is only sent for models LiteLLM marks as supporting it (sent for `gpt-4.1`, not for `gpt-4o-mini`), so a switch between such models changes whether the key appears at all.

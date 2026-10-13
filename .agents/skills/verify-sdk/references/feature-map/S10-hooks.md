@@ -44,42 +44,110 @@ Examples: `examples/01_standalone_sdk/33_hooks/main.py`, `examples/01_standalone
 ## Driving it
 
 Preconditions:
+- `uv sync --dev` has run; `control-sdk` is on `PATH` (`export PATH="$PWD/.agents/skills/verify-sdk/scripts:$PATH"`). `sdk-map run` does both.
+- `bash` and `tmux` on `PATH`: the hook scripts in `programs/S10/hooks/` are bash, and the conversations use `TerminalTool`.
+- Live bullets: `DEEPSEEK_API_KEY` exported; `git` on `PATH` for example 33.
 
-- `uv sync --dev` has run; `bash` available (command-hook tests run shell commands).
-- `LLM_API_KEY` and `LLM_MODEL` exported for the example bullets; `git` on `PATH` for example 33.
-
-- **Config, matchers, executor, manager, prompt and agent hook parsing (`S10.config-format`, `S10.definition-validation`, `S10.config-discovery`, `S10.matcher`, `S10.command-exec`, `S10.exit-codes`, `S10.async-hooks`, `S10.prompt-hook`, `S10.agent-hook`, `S10.llm-follows-switch`).** LLM calls are mocked.
+- **Command hooks at every lifecycle event (`S10.config-discovery`, `S10.command-exec`, `S10.matcher`, `S10.exit-codes`, `S10.async-hooks`, `S10.pre-tool-use-block`, `S10.post-tool-use`, `S10.user-prompt-context`, `S10.stop-hook`, `S10.session-start`, `S10.session-end-on-close`, `S10.execution-events`).** The program writes `<workspace>/.openhands/hooks.json` (legacy wrapper, PascalCase keys) pointing at the scripts in `programs/S10/hooks/`, loads it with `HookConfig.load(working_dir=...)` and passes it to a persisted conversation. The scripted agent runs `rm -rf build` and a `file_editor create` in one response, tries to finish, creates `done.txt`, and finishes; the program closes the conversation and reloads the saved events.
   ```sh
-  uv run pytest tests/sdk/hooks/test_config.py tests/sdk/hooks/test_executor.py tests/sdk/hooks/test_manager.py -q
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S10/hooked_run \
+    --check execution_status eq finished \
+    --check build_kept eq true --check notes_written eq true \
+    --check rejections eq 1 --check rejection_source eq hook --check rejection_reason contains "rm -rf is blocked" \
+    --check pre_terminal_blocked.0 eq true --check pre_terminal_exit_codes.0 eq 2 --check pre_terminal_action_ids_set eq true \
+    --check pre_file_calls eq 1 \
+    --check env_event_type eq PreToolUse --check env_tool_name eq terminal \
+    --check env_project_dir_is_workspace eq true --check env_session_id_is_conversation eq true --check cwd_is_workspace eq true \
+    --check post_tools contains file_editor --check post_has_tool_response eq true --check post_file_editor_input_command eq create \
+    --check soft_fail_exit_codes.0 eq 1 --check soft_fail_blocked eq false --check soft_fail_success eq false --check soft_fail_stderr eq "soft failure" \
+    --check async_got_stdin eq PostToolUse --check async_alive_after_close eq false \
+    --check user_extended_content.0 eq "HOOK-CONTEXT: the build is green" --check llm_saw_context eq true \
+    --check stop_blocked.0 eq true --check stop_blocked.1 eq false \
+    --check stop_feedback.0 contains "Create done.txt first." --check llm_calls eq 4 \
+    --check hook_events_by_type.SessionStart eq 1 --check session_start_log_lines eq 1 \
+    --check hook_events_by_type.SessionEnd eq 1 --check session_ended_file eq true \
+    --check hook_event_fields contains hook_input --check hook_event_fields contains additional_context \
+    --check stored_hook_config_events len-eq 6
   ```
-  All pass.
-- **Hooks wired into conversation state (`S10.pre-tool-use-block`, `S10.post-tool-use`, `S10.user-prompt-context`, `S10.user-prompt-block`, `S10.blocked-state-persistence`, `S10.stop-hook`, `S10.session-start`, `S10.execution-events`).**
+  The blocked `rm -rf` becomes a `UserRejectObservation` with `rejection_source="hook"` while the `file_editor` call of the same response still runs; the `/file_.*/` matcher fires only for `file_editor`; the exit-1 hook is a logged failure that blocks nothing; the async hook got the event on stdin and its `sleep` is gone once `close()` ran `SessionEnd`; the hook's `additionalContext` is in the saved user message and in the first LLM request; the first finish is sent back with `[Stop hook feedback] Create done.txt first.`.
+- **A denied prompt across a resume (`S10.user-prompt-block`, `S10.*-state-persistence`).** A `UserPromptSubmit` hook (`deny_secret_prompt.sh`, exit 2) blocks a message; the program closes, reopens the persisted conversation with a model that has nothing scripted (any LLM call would raise), runs it, and reopens once more. An action id the program marks with `state.block_action(...)` rides along to show `blocked_actions` persists too.
   ```sh
-  uv run pytest tests/sdk/hooks/test_integration.py tests/sdk/agent/test_action_batch.py tests/sdk/conversation/local/test_state_serialization.py -q
-  uv run pytest tests/sdk/test_agent_step_bounded_scan.py -q
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S10/blocked_prompt \
+    --check blocked_after_send eq 1 --check block_reason eq "asking for the secret is not allowed" \
+    --check blocked_after_reopen eq 1 --check same_message_blocked eq true --check action_block_after_reopen eq true \
+    --check run_error missing --check execution_status eq finished --check agent_messages len-eq 0 \
+    --check blocked_after_run eq 0 --check action_block_after_pop eq false \
+    --check user_prompt_hook_blocked.0 eq true --check hook_message_id_set eq true
   ```
-  All pass; the second command takes about two minutes.
-- **Plugin hooks (`S10.plugin-hooks-merge`).**
+- **Config forms, validation, discovery, matchers and exit codes (`S10.config-format`, `S10.definition-validation`, `S10.config-discovery`, `S10.matcher`, `S10.exit-codes`, `S10.command-exec`).** Through the public classes, without a conversation (as example 57 uses `HookManager`): typed, PascalCase and legacy-wrapper configs, `async` alias and merge; the user `hooks.json` under `OH_PERSISTENCE_DIR`; each kind of command-hook answer.
   ```sh
-  uv run pytest tests/sdk/conversation/test_local_conversation_plugins.py tests/sdk/plugin/test_plugin_loader.py -q
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S10/config_forms \
+    --check typed_pre_tool_use eq 1 --check pascal_pre_tool_use eq 1 --check legacy_events len-eq 2 \
+    --check unknown_event_rejected eq true --check both_spellings_rejected eq true --check extra_field_rejected eq true \
+    --check async_alias eq true --check async_dumps_as.0 eq async --check async_roundtrip eq true \
+    --check merged_pre_tool_use eq 2 --check merged_stop eq 1 \
+    --check command_requires_command eq true --check prompt_requires_prompt eq true --check prompt_forbids_command eq true \
+    --check prompt_forbids_async eq true --check agent_forbids_command eq true --check agent_forbids_async eq true \
+    --check display_prompt eq prompt-hook:policy --check display_agent eq agent-hook:review --check display_command eq ./check.sh \
+    --check missing_is_empty eq true --check user_file_found eq true --check project_wins eq true --check explicit_path eq true \
+    --check match.star_any eq true --check match.empty_any eq true --check match.star_no_tool eq true \
+    --check match.exact_no_tool eq false --check match.exact eq true --check match.exact_other eq false \
+    --check match.slash_regex eq true --check match.auto_regex eq true --check match.full_match_only eq false \
+    --check match.bad_regex_exact eq true \
+    --check exit0.continue eq true --check exit0.success eq true \
+    --check exit2.continue eq false --check exit2.blocked eq true \
+    --check exit1.continue eq true --check exit1.blocked eq false --check exit1.success eq false \
+    --check json_deny.continue eq false --check json_deny.reason eq policy \
+    --check json_continue_false.continue eq false --check json_non_string_decision.continue eq true \
+    --check missing_command.success eq false --check missing_command.exit_code eq 127 --check missing_command.continue eq true \
+    --check chain_continue eq false --check chain_results eq 1 --check chain_second_ran eq false \
+    --check timeout_error contains "timed out" --check timeout_success eq false
   ```
-  All pass.
-- **Command hooks with a real model (`S10.command-exec`, `S10.pre-tool-use-block`, `S10.post-tool-use`, `S10.user-prompt-context`, `S10.stop-hook`).**
+- **Prompt and agent hooks with a scripted model (`S10.prompt-hook`, `S10.agent-hook`, `S10.llm-follows-switch`).** A prompt hook on `PreToolUse(terminal)` and an agent hook on `Stop` answer from the conversation's own scripted LLM (hook copies share the script queue): a JSON deny blocks `ls`, a prose answer falls open, a fenced-JSON deny from the agent hook keeps the agent running, prose plus JSON allows it to stop. After `conversation.switch_llm(...)` the prompt hook answers from the new model.
   ```sh
-  uv run python examples/01_standalone_sdk/33_hooks/main.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S10/llm_hooks \
+    --check first_status eq finished --check first_script_left eq 0 --check execution_status eq finished \
+    --check pre_commands.0 eq prompt-hook:policy \
+    --check pre_blocked.0 eq true --check pre_success.0 eq true \
+    --check pre_blocked.1 eq false --check pre_success.1 eq false --check pre_errors.1 contains "no parseable JSON" \
+    --check rejection_reasons.0 eq "listing files is not allowed" --check fall_open_ran eq true \
+    --check stop_commands.0 eq agent-hook:reviewer --check stop_blocked.0 eq true --check stop_reasons.0 eq "write REPORT.md" \
+    --check stop_blocked.1 eq false --check stop_feedback.0 eq "[Stop hook feedback] write REPORT.md" \
+    --check rejection_reasons.1 eq "the switched model says no" --check switched_script_left eq 0 \
+    --check usage_ids contains prompt-hook:policy
   ```
-  Demo 1 prints a `tool_usage.log` line for the `echo`; demo 2's `rm -rf /tmp/test` is rejected by `block_dangerous.sh`; demo 3 gets the git status injected and cannot finish until `summary.txt` exists, then prints its start.
-- **Agent hooks with a real model (`S10.agent-hook`, `S10.stop-hook`, `S10.execution-events`).**
+  The agent hook's own metrics (`agent-hook:<name>`) need a real `LLM`: the SDK's stats registry skips `TestLLM` (see Gotchas), so that part is proven by example 51 below.
+- **Plugin hooks next to explicit ones (`S10.plugin-hooks-merge`).** An explicit `PostToolUse` hook, a plugin attached with `plugins=[PluginSource(...)]` and, after the first run, a plugin loaded with `load_plugin("runtime-hooks@local")` from the local marketplace in `programs/S10/marketplace/`; each hook appends its name to `order.log`.
   ```sh
-  uv run python examples/01_standalone_sdk/51_agent_hooks/main.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S10/plugin_hooks \
+    --check execution_status eq finished \
+    --check order_after_first_run.0 eq start-attached --check order_after_first_run.1 eq explicit --check order_after_first_run.2 eq attached \
+    --check post_tool_use_matchers_before_load eq 2 --check post_tool_use_matchers_after_load eq 3 \
+    --check order.-3 eq explicit --check order.-2 eq attached --check order.-1 eq runtime \
+    --check resolved_plugins len-eq 2
   ```
-  Demo 1 prints `[hook] PreToolUse DENY  -> agent-hook:security-reviewer` with a reason for the `awk '{print}' /etc/passwd` call; demo 2 prints `Stop` lines from `agent-hook:quality-reviewer` (DENY while `REPORT.md` is missing, ALLOW once it exists) and a `REPORT.md` preview.
-- **Prompt hooks with a real model (`S10.prompt-hook`).**
+- **Command hooks with a real model, example 33 (`S10.command-exec`, `S10.pre-tool-use-block`, `S10.post-tool-use`, `S10.user-prompt-context`, `S10.stop-hook`).** Live.
   ```sh
-  uv run python examples/01_standalone_sdk/57_prompt_hooks/main.py
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk exec --model-env --expect-output "Example Complete!" --expect-output "EXAMPLE_COST" -- python examples/01_standalone_sdk/33_hooks/main.py
   ```
-  Prints `ALLOW python -m pytest -q` and `DENY  find / -type f -delete` with the model's reasons; the script asserts both verdicts, so a model that disagrees makes it exit non-zero.
-- **SessionEnd on close (`S10.session-end-on-close`), untested.** Give a conversation `session_end=[HookMatcher(hooks=[HookDefinition(command="touch ended")])]`, send one message, call `conversation.close()`, and check that `ended` exists in the workspace. No test drives this through a conversation.
+  Demo 1 prints a `tool_usage.log` line for the `echo`; demo 2's `rm -rf /tmp/test` is rejected by `block_dangerous.sh`; demo 3 gets the git status injected and cannot finish until `summary.txt` exists.
+- **Agent hooks with a real model, example 51 (`S10.agent-hook`, `S10.stop-hook`, `S10.execution-events`).** Live.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk exec --model-env --expect-output "Example Complete!" --expect-output "EXAMPLE_COST" -- python examples/01_standalone_sdk/51_agent_hooks/main.py
+  ```
+  Demo 1 prints `[hook] PreToolUse DENY  -> agent-hook:security-reviewer` for the `awk '{print}' /etc/passwd` call; demo 2 prints `Stop` lines from `agent-hook:quality-reviewer` and a `REPORT.md` preview.
+- **Prompt hooks with a real model, example 57 (`S10.prompt-hook`).** Live; the script asserts both verdicts, so a model that disagrees makes it exit non-zero.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk exec --model-env --expect-output "ALLOW" --expect-output "DENY" -- python examples/01_standalone_sdk/57_prompt_hooks/main.py
+  ```
 
 ## Gotchas
 
@@ -92,3 +160,7 @@ Preconditions:
 - Agent hooks spend tokens on every matching event (one sub-conversation per call), and run synchronously before the tool; a broad matcher on `PreToolUse` multiplies cost and latency.
 - `examples/01_standalone_sdk/51_agent_hooks/main.py` and `57_prompt_hooks/main.py` default `LLM_MODEL` to `anthropic/claude-sonnet-4-5-20250929`, unlike the other examples (`gpt-5.5`).
 - `tests/sdk/test_agent_step_bounded_scan.py` passes but takes about 120 s on this machine; budget for it when running the hook suite under a timeout.
+- `conversation.load_plugin(...)` rebuilds the hook processor and runs `SessionStart` again for every configured hook (explicit and earlier plugins too), not only the new plugin's: `programs/S10/plugin_hooks.py` sees `start-attached` twice.
+- `PostToolUse` hooks with matcher `*` also run for the `finish` tool's observation.
+- `LocalConversation` registers only plain `LLM` objects in its stats registry (`AgentBase.get_all_llms` skips subclasses), so with a scripted `TestLLM` neither `agent` nor `agent-hook:<name>` shows up in `conversation_stats.usage_to_metrics`; prompt-hook metrics are merged directly and do show up. Prove agent-hook spend with a real model.
+- `control-sdk exec --expect-output` looks only at the last 1500 characters of stdout; pick strings the examples print at the end.

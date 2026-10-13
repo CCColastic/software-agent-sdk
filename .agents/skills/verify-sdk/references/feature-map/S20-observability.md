@@ -42,45 +42,123 @@ Examples: `examples/01_standalone_sdk/27_observability_laminar.py`
 ## Driving it
 
 Preconditions:
-- `uv sync --dev` has run (`lmnr` is a core dependency of `openhands-sdk`).
-- For the example: `LLM_API_KEY`, `LLM_MODEL`, and `LMNR_PROJECT_API_KEY` (or an `OTEL_*` endpoint) exported, and network to the trace backend.
+- `uv sync --dev` has run (`lmnr` and the OpenTelemetry protobuf packages are core dependencies); `control-sdk` is on `PATH` (`export PATH="$PWD/.agents/skills/verify-sdk/scripts:$PATH"`). `sdk-map run` does both.
+- `tmux` on `PATH`. No external service: traces go to a local OTLP/HTTP collector the program runs (`programs/S20/otlp.py`, decoding `ExportTraceServiceRequest`), and the program sets the endpoint variables before it imports the SDK, as a user's program must. The `model` mode borrows the scripted OpenAI-compatible endpoint from `programs/S18/servers.py`.
+- Live bullets: `DEEPSEEK_API_KEY`; example 27 also needs `LMNR_PROJECT_API_KEY`.
 
-- **Enablement, init, root spans, delegate traces (`S20.enable-gate`, `S20.lazy-import`, `S20.laminar-init`, `S20.root-span`, `S20.delegate-trace`, `S20.get-env`).** Laminar is mocked.
+- **Traces of a conversation, settings passed to `Conversation(...)` (`S20.enable-gate`, `S20.otel-backend`, `S20.root-span`, `S20.conversation-args`, `S20.step-and-tool-spans`, `S20.parallel-span-context`).** `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` points at the local collector (generic OTLP backend, no Laminar key); a scripted agent runs one terminal call, then two in parallel (`tool_concurrency_limit=2`), then finishes.
   ```sh
-  uv run pytest tests/sdk/observability -q
-  uv run pytest tests/sdk/test_import_performance.py -q
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S20/traced_conversation --arg args \
+    --check status eq finished --check enabled eq true --check otlp_posts ge 1 \
+    --check summary.traces eq 1 --check root.found eq true --check root.is_trace_root eq true \
+    --check root_user_id eq user-7 --check root_session_id_is_conversation eq true \
+    --check root_attr_ticket eq OPS-1 --check root_meta_ticket eq OPS-1 --check root_tag_team eq infra \
+    --check root_tags contains nightly --check root_tags contains verify \
+    --check summary.names contains nightly-run --check summary.names contains conversation.send_message \
+    --check summary.names contains conversation.run --check summary.names contains agent.step \
+    --check steps eq 3 --check terminal_spans eq 3 --check tool_spans eq 4 \
+    --check tool_call_ids contains call_1_0 --check tool_call_ids contains call_1_1 \
+    --check terminal_input_is_action eq true --check tools_under_step eq true --check parallel_terminal_parents eq 2
   ```
-  All tests pass.
-- **Conversation span arguments (`S20.root-span`, `S20.conversation-args`).**
+  The collector's root span `conversation` carries the session id (the conversation id), `user_id`, the metadata both as span attributes (`ticket`, `attempt`) and as trace metadata, the observability tags and `conversation.tags.team`; the custom span name is a child span `nightly-run`. Every TOOL span (three `TerminalAction`, one `FinishAction`) sits under an `agent.step`, carries its `tool_call_id`, and the two parallel calls share their step's span as parent.
+- **Settings from the environment, and an external caller's span (`S20.env-conversation-defaults`, `S20.external-entry`).** A webhook-style handler opens a span, `init_laminar_for_external()` returns its context, and the runner hands it over in `OPENHANDS_OBSERVABILITY_PARENT_SPAN_CONTEXT` together with `OPENHANDS_OBSERVABILITY_METADATA` and `OPENHANDS_OBSERVABILITY_SPAN_NAME`; the conversation gets no observability arguments.
   ```sh
-  uv run pytest tests/sdk/conversation/test_base_span_management.py tests/sdk/conversation/local/test_span_double_ending.py tests/sdk/conversation/test_conversation_factory.py -q
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S20/traced_conversation --arg env \
+    --check status eq finished --check external_context eq true \
+    --check root.found eq true --check root_has_parent eq true --check parent_trace_joined eq true \
+    --check root_automation_id eq auto-9 --check summary.names contains env-span \
+    --check summary.names contains webhook-handler
   ```
-  All tests pass.
-- **Step, tool, parallel, LLM and utility spans (`S20.step-and-tool-spans`, `S20.parallel-span-context`, `S20.llm-span`, `S20.utility-operation-metadata`).** Most of these export to an in-memory OTel exporter (`InMemorySpanExporter`).
+- **Self-hosted Laminar backend (`S20.laminar-init`, `S20.enable-gate`).** `LMNR_PROJECT_API_KEY` with `LMNR_BASE_URL`/`LMNR_HTTP_PORT` aimed at the local collector, `LMNR_FORCE_HTTP=true`, and `LMNR_INSTRUMENTS=litellm,not-an-instrument`.
   ```sh
-  uv run pytest tests/sdk/agent/test_tool_span_input.py tests/sdk/agent/test_tool_span_tool_call_id_metadata.py tests/sdk/agent/test_parallel_tool_span_context.py tests/sdk/llm/test_llm_span_cost.py tests/sdk/conversation/test_utility_llm_span_metadata.py -q
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S20/traced_conversation --arg laminar \
+    --check status eq finished --check otlp_posts ge 1 --check auth_header eq "Bearer lmnr-verify-key" \
+    --check root.found eq true --check steps eq 3 \
+    --check warnings contains "Ignoring invalid LMNR_INSTRUMENTS value 'not-an-instrument'"
   ```
-  All tests pass.
-- **Automation helpers and headers (`S20.automation-context`, `S20.automation-kwargs`, `S20.automation-headers`, `S20.env-conversation-defaults`).** The env readers are covered here; the conversation-level merge is not.
+  The spans arrive over HTTP at `<LMNR_BASE_URL>:<LMNR_HTTP_PORT>` with the project key as Bearer token; the bad instrument name is logged and ignored.
+- **LLM spans and utility calls (`S20.llm-span`, `S20.utility-operation-metadata`).** The agent's LLM is a real `LLM` (through LiteLLM) against the local scripted endpoint, which answers like a LiteLLM proxy with `x-litellm-response-cost: 0.0125` and 40 cached prompt tokens; afterwards the program calls `generate_title()` and `ask_agent()`.
   ```sh
-  uv run pytest tests/sdk/test_automation_observability.py tests/sdk/workspace/remote/test_remote_workspace_mixin.py -q
-  uv run pytest tests/sdk/workspace/remote/test_remote_workspace.py::test_send_completion_callback_includes_observability_headers -q
-  uv run pytest tests/sdk/conversation/remote/test_remote_conversation.py -q -k observability
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S20/traced_conversation --arg model \
+    --check status eq finished --check llm_spans eq 5 --check llm_under_step eq 3 --check llm_under_conversation eq 5 \
+    --check llm_costs len-eq 1 --check llm_costs.0 eq 0.0125 --check llm_cache_read.0 eq 40 \
+    --check metrics_cost eq 0.05 --check title eq "Scripted title" --check answer eq "Scripted answer" \
+    --check title_operation contains title_generation --check ask_operation contains ask_agent
   ```
-  All tests pass.
-- **Third-party log suppression (`S20.logger-quiet-thirdparty`).**
+  One `llm.<model>` LLM span per call, each holding the proxy's cost (the same figure `Metrics` accumulates: four agent-LLM calls, 0.05) and the cache-read bucket; the three agent calls nest under `agent.step`, the title and `ask_agent` calls under their own spans marked `openhands.operation`.
+- **Sub-agent traces (`S20.delegate-trace`).** Inside a `task` TOOL span carrying a `tool_call_id`, a sub-agent conversation is created within `detached_delegate_context()`, as the task tool does.
   ```sh
-  uv run pytest tests/sdk/logger -q
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S20/traced_conversation --arg delegate \
+    --check status eq finished --check conversation_traces eq 2 \
+    --check link_keys contains delegate.parent_trace_id --check link_keys contains delegate.parent_span_id \
+    --check link_keys contains tool_call_id \
+    --check delegate.task_span eq true --check delegate.child_new_trace eq true --check delegate.child_is_trace_root eq true \
+    --check delegate.child_parent_trace_ok eq true --check delegate.child_tool_call_id eq call_task_1
   ```
-  3 tests pass.
-- **Live Laminar trace (`S20.laminar-init`, `S20.root-span`), blocked without a Laminar key.**
+- **Observability off (`S20.lazy-import`, `S20.enable-gate`, `S20.external-entry`).** No endpoint variables: the same conversation runs, nothing is exported, `lmnr` is never imported, and `init_laminar_for_external()` returns `None`.
   ```sh
-  LMNR_PROJECT_API_KEY=... uv run python examples/01_standalone_sdk/27_observability_laminar.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S20/traced_conversation --arg off \
+    --check status eq finished --check enabled eq false --check lmnr_imported eq false \
+    --check otlp_posts eq 0 --check root.found eq false --check external_context missing --check import_seconds lt 10
   ```
-  The script prints `All done!`; the Laminar dashboard shows one trace whose session is the conversation id, with `conversation.send_message`, `conversation.run`, `agent.step`, a terminal TOOL span and LLM spans.
-- **External entry (`S20.external-entry`), untested.** Nothing calls `init_laminar_for_external()` in tests or examples, so there is no recipe yet.
-- **Generic OTLP backend (`S20.otel-backend`), untested.** Point `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` at a collector (with `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf` for HTTP) and run example 27 without `LMNR_PROJECT_API_KEY`; spans should reach the collector. No test covers this branch.
-- **Logging configuration (`S20.logger-config`, `S20.rolling-log-view`), untested.** For example `LOG_JSON=1 LOG_TO_FILE=1 LOG_DIR=/tmp/ohlogs uv run python -c "from openhands.sdk import get_logger; get_logger('x').info('hi')"` should print one JSON line and write `/tmp/ohlogs/app.log`. No test covers it.
+- **Automation helpers and headers (`S20.automation-context`, `S20.automation-kwargs`, `S20.automation-headers`, `S20.get-env`, `S20.enable-gate`).** The runner's `OPENHANDS_OBSERVABILITY_*` variables become `Conversation(...)` kwargs (used for a scripted conversation) and agent-server headers; a `RemoteWorkspace` aimed at a local capture server sends them on its command call and its completion callback.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S20/automation_env \
+    --check context.observability_tags len-eq 3 --check context.observability_metadata.extra eq 1 \
+    --check context.observability_span_name eq automation-run --check context.observability_parent_span_context eq parent-ctx-token \
+    --check kwargs.tags.automationtrigger eq automation --check kwargs.tags.automationid eq auto-1 \
+    --check kwargs.tags.automationrunid eq run-5 --check kwargs.tags.team eq infra \
+    --check kwargs.observability_tags len-eq 2 --check kwargs.observability_span_name eq automation-run \
+    --check explicit_span_name eq explicit-span \
+    --check headers.X-OpenHands-Observability-Tags eq nightly,verify \
+    --check headers.X-OpenHands-Observability-Span-Name eq automation-run \
+    --check headers.X-OpenHands-Observability-Parent-Span-Context eq parent-ctx-token \
+    --check conversation_tags.automationname eq Nightly --check conversation_tags.team eq infra \
+    --check workspace_headers.x-openhands-observability-span-name eq automation-run \
+    --check workspace_headers.x-openhands-observability-parent-span-context eq parent-ctx-token \
+    --check workspace_headers.x-openhands-observability-metadata contains auto-1 \
+    --check callback_headers.x-openhands-observability-span-name eq automation-run \
+    --check exec_thread.value.0 eq automation-run --check exec_thread.error missing \
+    --check gate.OTEL_ENDPOINT eq True --check gate.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT eq True \
+    --check gate.OTEL_EXPORTER_OTLP_ENDPOINT eq True
+  ```
+  Reading the variables from code `exec`'d in a thread works (no `find_dotenv()` stack walk). `dotenv_enables` reports `True`: the SDK itself never reads `.env`, but importing it imports LiteLLM, which loads `./.env` into `os.environ` (see Gotchas).
+- **Logging configuration (`S20.logger-config`, `S20.logger-quiet-thirdparty`, `S20.rolling-log-view`).** Fresh processes with different `LOG_*` environments log through `get_logger`, a LiteLLM and an httpx logger, and a `rolling_log_view`.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S20/logging_setup \
+    --check default.handlers contains RichHandler --check default.console_has_info eq true --check default.console_json_records eq 0 \
+    --check default.propagate eq true --check default.litellm_level eq ERROR --check default.openai_level eq ERROR \
+    --check default.litellm_line_shown eq false --check default.httpx_line_shown eq false \
+    --check default.rolling_buffer len-eq 2 --check default.rolling_buffer.1 eq roll-3 \
+    --check json_file.handlers contains TimedRotatingFileHandler --check json_file.console_json_records ge 5 \
+    --check json_file.rolling_snapshot_records eq 1 --check json_file.file_exists eq true \
+    --check json_file.file_has_info eq true --check json_file.file_is_json eq true \
+    --check plain_file.file_has_info eq true --check plain_file.file_is_json eq false \
+    --check ci.handlers len-eq 1 --check ci.console_json_records ge 1 --check ci.rolling_snapshot_records eq 0 \
+    --check debug.root_level eq DEBUG --check debug.console_has_debug eq true \
+    --check warning_level.console_has_info eq false --check no_auto_config.handlers len-eq 0
+  ```
+  Default: a Rich console handler; `LOG_JSON=1` a JSON stream handler and, with `LOG_TO_FILE`, a JSON `<LOG_DIR>/app.log`; `CI=true` JSON on the console; `DEBUG=true` lowers the root to DEBUG; `LOG_AUTO_CONFIG=false` adds no handler. In JSON mode `rolling_log_view` emits one record with the header and the last N lines on exit.
+- **Live: a real model traced to the local collector (`S20.root-span`, `S20.llm-span`, `S20.step-and-tool-spans`).**
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk program S20/traced_conversation --arg live \
+    --check status eq finished --check root.found eq true --check llm_spans ge 1 --check terminal_spans ge 1 \
+    --check tools_under_step eq true
+  ```
+- **Example 27 against Laminar (`S20.laminar-init`, `S20.root-span`), blocked: needs `LMNR_PROJECT_API_KEY` (a Laminar project) and network to api.lmnr.ai.** The trace shows up in the Laminar dashboard with the conversation id as session.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk exec --model-env --expect-output "All done" -- python examples/01_standalone_sdk/27_observability_laminar.py
+  ```
 
 ## Gotchas
 
@@ -92,3 +170,8 @@ Preconditions:
 - `CI=true` or `GITHUB_ACTIONS` switches console logs to JSON.
 - `tests/sdk/test_import_performance.py` measures import time and can be slow or flaky on a loaded machine; the S20 batch took about 50 s here.
 - Agent-server telemetry (`tests/agent_server/telemetry/`) and server-side span routes belong to the server map, not here.
+- Importing the SDK imports LiteLLM, which calls `load_dotenv()` on `./.env`: an `OTEL_*` or `LMNR_*` line in a `.env` in the program's working directory turns observability on even though the SDK itself never reads `.env`.
+- `setup_logging` sets `httpx` and `libtmux` loggers to `LOG_LEVEL`, but they do not reach the SDK's handlers, so their INFO lines still do not show (their warnings go to Python's last-resort handler).
+- `automation_observability_headers()` and `automation_conversation_kwargs()` deduplicate `OPENHANDS_OBSERVABILITY_TAGS`; the headers a `RemoteWorkspace` sends from the same variable do not (`nightly,verify,nightly`).
+- `TestLLM` bypasses LiteLLM, so a scripted conversation produces no LLM spans; to see `llm.*` spans use a real `LLM` against an OpenAI-compatible endpoint (the `model` mode's local fake).
+- Span attribute keys contain dots (`lmnr.association.properties.user_id`); control-sdk check paths split on every dot, so programs copy the ones a recipe checks to flat result fields.

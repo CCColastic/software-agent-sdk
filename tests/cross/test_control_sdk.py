@@ -58,7 +58,14 @@ def _cli(capsys, *argv):
 
 
 def test_checks_cover_every_operator():
-    body = {"a": 3, "s": "hello", "l": ["x", "yz"], "n": None, "t": True}
+    body = {
+        "a": 3,
+        "s": "hello",
+        "l": ["x", "yz"],
+        "n": None,
+        "t": True,
+        "d": {"k.dotted": 1},
+    }
     cases = [
         (["a", "eq", "3"], True),
         (["a", "ne", "3"], False),
@@ -74,6 +81,7 @@ def test_checks_cover_every_operator():
         (["l.1", "eq", "yz"], True),
         (["l.-1", "eq", "yz"], True),
         (["t", "eq", "true"], True),
+        ([r"d.k\.dotted", "eq", "1"], True),
     ]
     for spec, expected in cases:
         assert control_sdk.evaluate_check(body, spec)["ok"] is expected, spec

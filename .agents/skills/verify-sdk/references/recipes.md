@@ -25,10 +25,12 @@ check` rejects a `Driving it` block that calls `pytest`.
   reader sees the expectation in the map.
 - **Commands and examples**: `control-sdk exec [--model-env] -- python
   examples/...` runs any command inside the run; `--model-env` exports
-  `LLM_MODEL`/`LLM_API_KEY` from the run's real model.
+  `LLM_MODEL`/`LLM_API_KEY` from the run's real model. An `examples/` path
+  marks a block as needing a model; a block whose example makes no model
+  call says so with a `# no model` line and then runs without a key.
 - **Checks**: every verb takes `--check FIELD OP [VALUE]` (ops: `eq ne lt le
   gt ge contains not-contains matches exists missing len-eq len-ge`; fields
-  are dotted paths, list indexes allowed) and `--field PATH` to print one
+  are dotted paths, list indexes allowed, `\.` for a dot inside a key) and `--field PATH` to print one
   value for the shell. A failed check exits 1; a missing model key exits 3,
   which `sdk-map run` reports as `blocked`.
 

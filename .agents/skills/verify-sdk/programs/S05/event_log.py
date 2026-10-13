@@ -26,7 +26,8 @@ import_tools(record["tools"])
 
 def note(text: str) -> MessageEvent:
     return MessageEvent(
-        source="user", llm_message=Message(role="user", content=[TextContent(text=text)])
+        source="user",
+        llm_message=Message(role="user", content=[TextContent(text=text)]),
     )
 
 

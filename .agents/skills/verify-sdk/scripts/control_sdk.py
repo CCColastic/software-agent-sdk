@@ -202,7 +202,7 @@ def save_record(run: Path, record: dict[str, Any]) -> None:
     (run / "state" / f"{record['id']}.json").write_text(json.dumps(record, indent=2))
 
 
-def open_conversation(run: Path, record: dict[str, Any]) -> tuple[Any, Any]:
+def open_conversation(_run: Path, record: dict[str, Any]) -> tuple[Any, Any]:
     """Build the agent and (re)open the persisted conversation."""
     script = record.get("script")
     remaining = None if script is None else script[record.get("used", 0) :]
@@ -399,9 +399,11 @@ def run_command(
         code, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
     except subprocess.TimeoutExpired as exc:
         code = 124
-        stdout = (exc.stdout or b"").decode(errors="replace") if isinstance(
-            exc.stdout, bytes
-        ) else (exc.stdout or "")
+        stdout = (
+            (exc.stdout or b"").decode(errors="replace")
+            if isinstance(exc.stdout, bytes)
+            else (exc.stdout or "")
+        )
         stderr = "timed out"
     secret = env.get("LLM_API_KEY")
     if secret:
@@ -415,6 +417,7 @@ def run_command(
         "result": last_json(stdout),
         "stdout_tail": stdout[-1500:],
         "stderr_tail": stderr[-1500:],
+        "_stdout": stdout,
     }
 
 
@@ -423,12 +426,14 @@ def python_command() -> list[str]:
 
 
 def finish_command(out: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    # --expect-output searches all of stdout, not just the tail it prints.
+    stdout = out.pop("_stdout", out["stdout_tail"])
     if out["exit"] == BLOCKED_EXIT:
         blocked = (out.get("result") or {}).get("blocked", "a prerequisite")
         raise CliError(f"blocked: {blocked}", exit_code=BLOCKED_EXIT, **out)
     expected = args.expect_exit
     ok = out["exit"] == expected
-    missing = [s for s in args.expect_output or [] if s not in out["stdout_tail"]]
+    missing = [s for s in args.expect_output or [] if s not in stdout]
     if missing:
         ok = False
         out["missing_output"] = missing
@@ -441,7 +446,9 @@ def cmd_program(args: argparse.Namespace) -> dict[str, Any]:
     name = args.name if args.name.endswith(".py") else args.name + ".py"
     path = PROGRAMS_DIR / name
     if not path.is_file():
-        usage_error(f"no program {name} under {PROGRAMS_DIR}", f"{CLI} program S05/roundtrip")
+        usage_error(
+            f"no program {name} under {PROGRAMS_DIR}", f"{CLI} program S05/roundtrip"
+        )
     out = run_command(
         run,
         [*python_command(), str(path), *(args.arg or [])],
@@ -521,8 +528,11 @@ CHECK_OPS = (
 
 
 def dig(body: Any, path: str) -> Any:
+    """Follow a dotted path; `\\.` is a literal dot inside a key
+    (`spans.0.attributes.lmnr\\.association\\.properties\\.user_id`)."""
     current = body
-    for part in path.split("."):
+    for raw in re.split(r"(?<!\\)\.", path):
+        part = raw.replace("\\.", ".")
         if isinstance(current, dict):
             current = current.get(part)
         elif isinstance(current, list) and re.fullmatch(r"-?\d+", part):
@@ -649,7 +659,11 @@ Which run: --run DIR, else ${RUN_ENV}, else the newest under ${HOME_ENV}
   export {RUN_ENV}=$({CLI} new --llm deepseek-flash --field run)""",
     )
     add_common(p)
-    p.add_argument("--llm", default="scripted", help="scripted (default), deepseek-flash, deepseek-pro")
+    p.add_argument(
+        "--llm",
+        default="scripted",
+        help="scripted (default), deepseek-flash, deepseek-pro",
+    )
     p.set_defaults(func=cmd_new)
 
     p = sub.add_parser("show", help="the run's model and conversations")
@@ -662,10 +676,13 @@ Which run: --run DIR, else ${RUN_ENV}, else the newest under ${HOME_ENV}
         formatter_class=Formatter,
         epilog=f"""Examples:
   CID=$({CLI} conversation new --script S01/finish.json --field id)
-  {CLI} conversation send "$CID" --text "say hi" --run --check execution_status eq finished
+  {CLI} conversation send "$CID" --text "say hi" --run """
+        f"""--check execution_status eq finished
   {CLI} conversation events "$CID" --kind ActionEvent --check count eq 1""",
     )
-    csub = conv.add_subparsers(dest="conversation_command", metavar="<new|send|run|state|events>")
+    csub = conv.add_subparsers(
+        dest="conversation_command", metavar="<new|send|run|state|events>"
+    )
 
     p = csub.add_parser(
         "new",
@@ -737,7 +754,8 @@ The checks read the program's own JSON result (its last output line).""",
         help="run a command inside the run (cwd = workspace, isolated env)",
         formatter_class=Formatter,
         epilog=f"""Examples:
-  {CLI} exec --model-env --expect-output "All done" -- python examples/01_standalone_sdk/01_hello_world.py
+  {CLI} exec --model-env --expect-output "All done" -- """
+        """python examples/01_standalone_sdk/01_hello_world.py
 
 Paths that exist in the checkout are made absolute. --model-env exports
 LLM_MODEL and LLM_API_KEY from the run's real model (exit 3 without its key).""",
@@ -788,7 +806,9 @@ def emit(out: dict[str, Any], field: str | None) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(normalize_argv(list(sys.argv[1:] if argv is None else argv)))
+    args = parser.parse_args(
+        normalize_argv(list(sys.argv[1:] if argv is None else argv))
+    )
     if not getattr(args, "func", None):
         parser.print_help()
         return 2

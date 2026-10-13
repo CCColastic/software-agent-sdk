@@ -204,7 +204,10 @@ def bullets(path: Path) -> list[dict[str, Any]]:
                 {
                     "label": label,
                     "ids": list(dict.fromkeys(ids)),
-                    "blocked": bool(re.search(r"\bblocked\b", label, re.I)),
+                    # Only the label's own words count, not backticked IDs.
+                    "blocked": bool(
+                        re.search(r"\bblocked\b", re.sub(r"`[^`]*`", "", label), re.I)
+                    ),
                     "blocks": [],
                 }
             )
@@ -263,7 +266,10 @@ def check_family(path: Path) -> list[str]:
     return problems
 
 
-CONTROL_SDK_RE = re.compile(r"\bcontrol-sdk\s+([^|;&)`\n]*)")
+# Arguments run to the first shell operator outside quotes.
+CONTROL_SDK_RE = re.compile(
+    r"""\bcontrol-sdk\s+((?:'[^']*'|"(?:\\.|[^"\\])*"|[^|;&)`\n'"])*)"""
+)
 
 
 def recipe_problems(statement: str) -> list[str]:
@@ -302,12 +308,17 @@ def control_sdk_problems(tokens: list[str]) -> list[str]:
     problems = []
     name = getattr(args, "name", None)
     if args.command == "program" and name:
-        program = control_sdk.PROGRAMS_DIR / (name if name.endswith(".py") else f"{name}.py")
+        program = control_sdk.PROGRAMS_DIR / (
+            name if name.endswith(".py") else f"{name}.py"
+        )
         if not program.is_file():
             problems.append(f"`{shown}`: no program {program.relative_to(SKILL_DIR)}")
     script = getattr(args, "script", None)
     if script and "$" not in script:
-        if not (control_sdk.PROGRAMS_DIR / script).is_file() and not Path(script).is_file():
+        if (
+            not (control_sdk.PROGRAMS_DIR / script).is_file()
+            and not Path(script).is_file()
+        ):
             problems.append(f"`{shown}`: no script programs/{script}")
     return problems
 
@@ -438,7 +449,8 @@ def cmd_owners(args: argparse.Namespace) -> dict[str, Any]:
     else:
         paths = list(args.paths)
     prefixes = {f.name: source_prefixes(f) for f in family_files()}
-    mapping, unowned = [], []
+    left_out = not_mapped_prefixes()
+    mapping, unowned, not_mapped = [], [], []
     for path in paths:
         owners = [
             name
@@ -447,6 +459,8 @@ def cmd_owners(args: argparse.Namespace) -> dict[str, Any]:
         ]
         if owners:
             mapping.append({"path": path, "families": owners})
+        elif any(path.startswith(p) for p in left_out):
+            not_mapped.append(path)
         elif PRODUCT_PATH_RE.match(path):
             unowned.append(path)
     return {
@@ -456,7 +470,18 @@ def cmd_owners(args: argparse.Namespace) -> dict[str, Any]:
         "families": sorted({n for row in mapping for n in row["families"]}),
         "mapped": mapping,
         "unowned_product_paths": unowned,
+        # Paths the index's "Not mapped" section leaves out, with its reason.
+        "not_mapped": not_mapped,
     }
+
+
+def not_mapped_prefixes() -> list[str]:
+    """Backticked paths in the index's "## Not mapped" section."""
+    path = index_path()
+    text = path.read_text() if path.exists() else ""
+    match = re.search(r"^## Not mapped\n(.*?)(?=^## |\Z)", text, re.S | re.M)
+    section = match.group(1) if match else ""
+    return [p for p in re.findall(r"`([^`\s]+)`", section) if "/" in p]
 
 
 def cmd_baseline(args: argparse.Namespace) -> dict[str, Any]:
@@ -542,6 +567,11 @@ def split_statements(block: str) -> list[str]:
     return statements
 
 
+# A block whose example makes no model call says so on its own line, and
+# then runs without a key.
+NO_MODEL_RE = re.compile(r"^\s*# no model\b", re.M)
+
+
 def needs_model(statement: str) -> bool:
     return bool(MODEL_COMMAND_RE.search(statement))
 
@@ -571,9 +601,7 @@ def kill_group(pgid: int) -> None:
             time.sleep(0.1)
 
 
-def run_script(
-    script: str, log: Any, timeout: float, home: Path | None = None
-) -> int:
+def run_script(script: str, log: Any, timeout: float, home: Path | None = None) -> int:
     """Run a script in its own process group; nothing it starts outlives it."""
     env = {k: v for k, v in os.environ.items() if k != "SDK_VERIFY_RUN"}
     env["PATH"] = os.pathsep.join([str(SKILL_DIR / "scripts"), env.get("PATH", "")])
@@ -657,7 +685,8 @@ def run_bullet(
     for b, block in enumerate(bullet["blocks"], 1):
         kept, checks = [], []
         statements = split_statements(block)
-        if not with_llm and any(needs_model(st) for st in statements):
+        no_model = bool(NO_MODEL_RE.search(block))
+        if not with_llm and not no_model and any(needs_model(st) for st in statements):
             # A block shares one control-sdk run; half of it proves nothing.
             result["skipped_model"] += 1
             continue
@@ -688,7 +717,7 @@ def run_bullet(
             )
             break
         result["proof"].update(proof_kind(st) for st in kept)
-        if any(proof_kind(st) in ("example", "live") for st in kept):
+        if not no_model and any(proof_kind(st) in ("example", "live") for st in kept):
             output = Path(log.name).read_text(errors="replace")[start_offset:]
             if re.search(r"^EXAMPLE_COST: 0(?:\.0+)?\s*$", output, re.M):
                 result["notes"].append(

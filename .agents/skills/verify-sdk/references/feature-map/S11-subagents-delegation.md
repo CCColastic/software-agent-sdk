@@ -47,45 +47,151 @@ Examples: `examples/01_standalone_sdk/25_agent_delegation.py`, `examples/01_stan
 ## Driving it
 
 Preconditions:
-- `uv sync --dev` has run.
-- `LLM_API_KEY` and `LLM_MODEL` (and optionally `LLM_BASE_URL`) exported for the example bullets.
+- `uv sync --dev` has run; `control-sdk` is on `PATH` (`export PATH="$PWD/.agents/skills/verify-sdk/scripts:$PATH"`). `sdk-map run` does both.
+- `tmux` on `PATH` (sub-agents use `TerminalTool`).
+- Live bullets: `DEEPSEEK_API_KEY` exported.
 
-- **Registry, schema and file discovery (`S11.register-programmatic`, `S11.register-if-absent`, `S11.markdown-schema`, `S11.file-discovery`, `S11.file-precedence`, `S11.plugin-agents`, `S11.definition-factory`, `S11.definition-model`, `S11.factory-info`, `S11.sub-agent-scope`).**
+Programs give each programmatic sub-agent its own scripted LLM (`programs/S11/s11_helpers.py` records every call); Markdown and built-in sub-agents get a copy of the parent's LLM, and copies of one `TestLLM` share its script queue, so a single script interleaves parent and sub-agent turns.
+
+- **The task tool's lifecycle (`S11.register-programmatic`, `S11.task-run`, `S11.task-resume`, `S11.task-errors`, `S11.task-limits`, `S11.task-metrics`, `S11.task-persistence`, `S11.task-hooks`).** A persisted parent with `TaskToolSet` delegates to `echoer` (which runs `echo hello` and has a `PostToolUse` hook in its definition), resumes `task_00000001`, asks for an unknown type and an unknown task id, runs `looper` (definition limit 1) and `crasher` (its LLM raises); a second parent with `max_iteration_per_run=2` delegates to `plodder`, which has no limit of its own.
   ```sh
-  uv run pytest tests/sdk/subagent -q
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S11/task_lifecycle \
+    --check execution_status eq finished \
+    --check first_task.task_id eq task_00000001 --check first_task.status eq completed --check first_task.text eq "said hello" \
+    --check hello_written eq true \
+    --check resume_task.task_id eq task_00000001 --check resume_task.text eq "you asked me to say hello" \
+    --check resume_saw_first_prompt eq true \
+    --check unknown_type.is_error eq true --check unknown_type.text contains "Unknown agent 'nobody'" \
+    --check unknown_resume.is_error eq true --check unknown_resume.text contains "Available tasks: task_00000001" \
+    --check looper.task_id eq task_00000002 --check looper.is_error eq true \
+    --check looper.text contains "maximum iterations limit" --check looper_llm_calls eq 1 \
+    --check plodder.is_error eq true --check plodder.text contains "maximum iterations limit" --check plodder_llm_calls eq 2 \
+    --check crasher.is_error eq true --check crasher.text contains "bad key" \
+    --check usage_ids contains task:task_00000001 --check usage_ids contains task:task_00000003 --check usage_ids len-eq 3 \
+    --check subagent_dirs eq 3 --check sub_hook_lines len-eq 1 --check sub_hook_lines.0 eq sub-hook
   ```
-  All tests pass with no LLM or network.
-- **Built-in agents (`S11.builtin-agents`).**
+  The resumed sub-agent's LLM request still holds the first prompt; a non-finished sub-agent comes back as an error observation with the run's error, never an empty success; three sub-conversations stay under `<parent>/subagents/` after close.
+- **Delegates share the parent's prompt-cache key (`S11.task-observability`).** Same scenario; each `echoer` LLM call records its call context.
   ```sh
-  uv run pytest tests/tools/test_builtin_agents.py -q
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S11/task_lifecycle \
+    --check sub_cache_key_is_parent.0 eq true --check sub_cache_key_is_parent.1 eq true \
+    --check sub_cache_key_is_parent.2 eq true --check sub_session_differs eq true
   ```
-  The four built-ins register; `web-researcher` is absent with `enable_browser=False`; deprecated names warn.
-- **Task tool lifecycle (`S11.task-run`, `S11.task-resume`, `S11.task-errors`, `S11.task-limits`, `S11.task-metrics`, `S11.task-persistence`, `S11.task-hooks`, `S11.task-observability`, `S11.sub-agent-scope`).** Mocked LLMs, deterministic.
+  Expected: every sub-agent call carries the parent conversation's id as `prompt_cache_key`, on create and on resume. Known failure (reproduced 2026-10-13, not yet filed): the two calls of the created task carry the parent's key, but the call made after `task(resume=...)` carries the sub-conversation's own id (`sub_cache_key_is_parent` is `[true, true, false]`): `TaskManager._resume_task` builds the `LocalConversation` without `prompt_cache_key=...`, unlike `_get_conversation`.
+- **Delegate trace metadata (`S11.task-observability`), blocked.** `is_delegate`, `task_id`, `subagent_type`, `parent_session_id`, the parent span link and the `delegate` tag go only to the observability backend; proving them needs a Laminar/OpenTelemetry collector to read spans from.
+- **Registry, Markdown definitions and factories (`S11.register-programmatic`, `S11.register-if-absent`, `S11.markdown-schema`, `S11.file-discovery`, `S11.file-precedence`, `S11.plugin-agents`, `S11.definition-factory`, `S11.definition-model`).** The program lays out agent files in the workspace (`.agents/agents/`, `.openhands/agents/`, a `README.md`, a nested dir), the user's home (`~/.agents/agents/`) and `$OH_PERSISTENCE_DIR/agents/`, saves an LLM profile, and goes through `openhands.sdk.subagent`.
   ```sh
-  uv run pytest tests/tools/task -q
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S11/registry \
+    --check schema.tools len-eq 2 --check schema.skills.0 eq house-style --check schema.color eq blue \
+    --check schema.max_iteration_per_run eq 7 --check schema.max_budget_per_run eq 0.5 \
+    --check schema.permission_mode eq always_confirm --check schema.condenser eq NoOpCondenser \
+    --check schema.hooks_post_tool_use eq 1 --check schema.mcp_servers.0 eq fetch \
+    --check schema.system_prompt eq "You are a careful reviewer." --check schema.examples len-eq 2 \
+    --check schema.metadata.team eq platform --check invalid_permission_mode contains "Invalid permission_mode" \
+    --check project_names len-eq 3 --check project_names not-contains deep --check project_names not-contains README \
+    --check discovered.reviewer.1 contains "Reviews code" --check discovered.shared.1 eq "project copy" \
+    --check discovered.user-only.0 eq user --check discovered.late.0 eq user \
+    --check registered_before_files len-eq 0 \
+    --check duplicate_error contains "already registered" --check unknown_error contains "Unknown agent 'nobody'" \
+    --check if_absent_returned eq false --check alpha_description eq "first alpha" \
+    --check file_registered len-eq 4 --check file_registered not-contains shared \
+    --check shared_description eq "programmatic shared" --check reviewer_from eq /.agents/agents/ \
+    --check plugin_registered len-eq 1 --check plugin_registered.0 eq plug --check plug_hooks_stop eq 1 \
+    --check factory.tools.0 eq terminal --check factory.suffix eq "You are a careful reviewer." \
+    --check factory.skills.0 eq house-style --check factory.mcp_servers.0 eq fetch \
+    --check factory.condenser eq NoOpCondenser --check factory.default_condenser eq LLMSummarizingCondenser \
+    --check factory.default_condenser_usage_id eq condenser \
+    --check unknown_tool_error contains "no_such_tool" --check unknown_skill_error contains "no-such-skill" \
+    --check profile_model eq openai/gpt-4o-mini --check inherit_same_llm eq true \
+    --check missing_profile_error contains "Profile nope not found"
   ```
-  The tests pass; then with a real model:
+- **Built-in agents and the task tool's type list (`S11.builtin-agents`, `S11.factory-info`).** `register_builtins_agents(enable_browser=False)`, then `True`; the deprecated names; the description `TaskToolSet.create(...)` gives the model.
   ```sh
-  uv run python examples/01_standalone_sdk/41_task_tool_set.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S11/builtins \
+    --check registered_without_browser len-eq 3 --check registered_without_browser not-contains web-researcher \
+    --check registered_later_with_browser.0 eq web-researcher --check registered len-eq 4 \
+    --check deprecated_maps_to.default eq general-purpose --check deprecated_maps_to.explore eq code-explorer \
+    --check deprecated_maps_to.bash eq bash-runner --check deprecated_warned.bash eq true \
+    --check description_lists.general-purpose eq true --check description_lists.web-researcher eq true \
+    --check example_in_description.code-explorer eq true --check example_in_description.bash-runner eq true
   ```
-  The quiz host calls `task` twice, the second time with `resume`, and prints `EXAMPLE_COST`.
-- **Programmatic plus built-in types in parallel (`S11.register-programmatic`, `S11.builtin-agents`, `S11.task-metrics`).**
+- **A usage example for every registered built-in (`S11.factory-info`).** Same program.
   ```sh
-  uv run python examples/01_standalone_sdk/25_agent_delegation.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S11/builtins \
+    --check example_in_description.general-purpose eq true --check example_in_description.web-researcher eq true
   ```
-  Two `task` calls run in parallel, a `bash-runner` sub-agent writes `london_trip_report.txt` into the current directory, and `EXAMPLE_COST` reflects sub-agent spend.
-- **Inline `AgentDefinition` (`S11.definition-factory`).**
+  Known failure (reproduced 2026-10-13, not yet filed): with all four built-ins registered, only the `code-explorer` and `bash-runner` examples appear. `TASK_TOOL_EXAMPLES` keys the other two as `"general purpose"` and `"web researcher"` (spaces), while the built-ins register as `general-purpose` and `web-researcher`, so their examples never match.
+- **Workspace Markdown agents picked up by the conversation (`S11.conversation-autoregister`, `S11.builtin-agents`, `S11.task-persistence`).** The workspace holds `.agents/agents/ws-reviewer.md`; the program never calls `register_file_agents`. A non-persisted parent delegates to it and to the built-in `bash-runner`.
   ```sh
-  uv run python examples/01_standalone_sdk/42_file_based_subagents.py
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S11/workspace_agents \
+    --check execution_status eq finished --check registered_before_send eq false --check registered_after_send eq true \
+    --check observations.0.subagent eq ws-reviewer --check observations.0.text eq "notes say hi" \
+    --check observations.1.subagent eq bash-runner --check observations.1.status eq completed \
+    --check builtin_written eq true --check description_lists_ws_reviewer eq true --check script_left eq 0 \
+    --check temp_task_dirs_before_close eq 1 --check temp_task_dirs_after_close eq 0
+  ```
+- **Sub-agent confirmation (`S11.task-confirmation`).** The program registers its own task tool set whose `create()` passes a `confirmation_handler`; `careful` has `permission_mode: always_confirm` and the handler rejects it; after `set_confirmation_policy(AlwaysConfirm())` on the parent, `inheritor` (no `permission_mode`) inherits the policy and the handler approves; a plain `TaskToolSet` without a handler approves on its own.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S11/task_confirmation \
+    --check handler_calls len-eq 2 \
+    --check handler_calls.0.task_id eq task_00000001 --check handler_calls.0.tools.0 eq terminal --check handler_calls.0.approved eq false \
+    --check careful_file eq false --check observations.0.text eq "careful done" \
+    --check parent_waited eq waiting_for_confirmation \
+    --check handler_calls.1.task_id eq task_00000002 --check handler_calls.1.approved eq true \
+    --check inherited_file eq true --check execution_status eq finished \
+    --check auto_file eq true --check plain_observations.0.status eq completed
+  ```
+- **Sub-agent scope (`S11.sub-agent-scope`).** A parent with only the terminal sets `sub_agent_scope: {tools: true}` on its task tool; `editor` needs `file_editor`, `sheller` needs the terminal and has its own task tool; a parent with no tools of its own is offered nothing.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S11/scope \
+    --check execution_status eq finished --check lists_sheller eq true --check lists_editor eq false \
+    --check observations.0.is_error eq true --check observations.0.text contains "uses file_editor, which this agent does not have" \
+    --check observations.1.status eq completed --check scoped_written eq true \
+    --check nested_task_tool_scoped eq true --check lonely_says_none eq true
+  ```
+- **DelegateExecutor and DelegationVisualizer (`S11.delegate-executor`, `S11.delegation-visualizer`).** No tool is registered for `DelegateExecutor`, so the program wraps it in a small `delegate` tool, the way a program would; two typed workers (each with its own scripted LLM) run in parallel threads; then too many spawns, a spawn with an unknown type, and a delegate to an id that was never spawned. The parent's `DelegationVisualizer(name="Lead")` output is captured.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --field run)
+  control-sdk program S11/delegate \
+    --check execution_status eq finished \
+    --check observations.0.text contains "Successfully spawned 2 sub-agents" \
+    --check observations.1.text contains "Agent lodging_expert: lodging wrote lodging.txt" \
+    --check observations.1.text contains "Agent activity_planner: activities wrote activities.txt" \
+    --check files len-eq 2 \
+    --check observations.2.is_error eq true --check observations.2.text contains "maximum is 5" \
+    --check observations.3.is_error eq true --check observations.3.text contains "no_such_type" \
+    --check observations.4.text contains "sub-agents not found: p" \
+    --check usage_ids contains delegate:lodging_expert --check usage_ids contains delegate:activity_planner \
+    --check subagent_dirs eq 2 \
+    --check visualizer.lead_titles eq true --check visualizer.sub_agent_titles eq true --check visualizer.sender_titles eq true
+  ```
+  The failed `p, q` spawn leaves nothing behind: `p` is unknown afterwards.
+- **Quiz with resume, example 41 (`S11.task-run`, `S11.task-resume`, `S11.delegation-visualizer`).** Live.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk exec --model-env --expect-output "EXAMPLE_COST" -- python examples/01_standalone_sdk/41_task_tool_set.py
+  ```
+  The quiz host calls `task` twice, the second time with `resume`.
+- **Programmatic plus built-in types in parallel, example 25 (`S11.register-programmatic`, `S11.builtin-agents`, `S11.task-metrics`).** Live.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk exec --model-env --expect-output "EXAMPLE_COST" -- python examples/01_standalone_sdk/25_agent_delegation.py
+  ```
+  Two `task` calls run in parallel, a `bash-runner` sub-agent writes `london_trip_report.txt` into the run's workspace, and `EXAMPLE_COST` includes sub-agent spend.
+- **Inline `AgentDefinition`, example 42 (`S11.definition-factory`).** Live.
+  ```sh
+  export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)
+  control-sdk exec --model-env --expect-output "EXAMPLE_COST" -- python examples/01_standalone_sdk/42_file_based_subagents.py
   ```
   The orchestrator delegates to `grammar-checker`, which reads `README.md` with `file_editor`.
-- **Delegate executor and visualizer (`S11.delegate-executor`, `S11.delegation-visualizer`).**
-  ```sh
-  uv run pytest tests/tools/delegate -q
-  ```
-  All tests pass.
-- **Workspace Markdown agents picked up by a conversation (`S11.conversation-autoregister`), untested.** Put a `.agents/agents/<name>.md` in the workspace, start a conversation with `TaskToolSet` and ask it to delegate to `<name>`; the `task` observation should name that sub-agent. No test proves this.
-- **Sub-agent confirmation (`S11.task-confirmation`), untested.** Needs a Markdown agent with `permission_mode: always_confirm` and a `confirmation_handler` that returns False; the sub-agent's actions should be rejected. No test exercises it.
 
 ## Gotchas
 
@@ -98,3 +204,7 @@ Preconditions:
 - `TaskAction.max_turns` is deprecated and ignored.
 - `tests/tools/delegate/test_delegation.py` emits `PydanticSerializationUnexpectedValue` warnings from `MagicMock` parents; they are harmless.
 - All three examples run in `tests/examples/test_examples.py` (none is in `_EXCLUDED_EXAMPLES`) but only on the `test-examples` label.
+- The user-level `.openhands/agents` directory is `$OH_PERSISTENCE_DIR/agents` (default `~/.openhands/agents`); only `.agents/agents` is resolved against `$HOME`.
+- `TaskToolSet` builds its type list and examples when the agent initializes (the first `send_message()`), after workspace agents are registered; agents registered later still run but are not in the description.
+- `TaskManager._resume_task` drops the parent's `prompt_cache_key` (see the known failure above); a resumed sub-agent starts a new cache shard.
+- With a scripted `TestLLM` the `task:<id>` entries in `conversation_stats.usage_to_metrics` exist but are empty: the stats registry tracks only plain `LLM` objects.
