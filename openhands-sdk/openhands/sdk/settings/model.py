@@ -52,6 +52,7 @@ from openhands.sdk.logger import get_logger
 from openhands.sdk.mcp.config import (
     MCPOAuthState,
     MCPServer,
+    drop_mcp_servers_without_endpoint,
 )
 from openhands.sdk.plugin import PluginSource
 from openhands.sdk.subagent.schema import AgentDefinition
@@ -772,23 +773,7 @@ def _migrate_agent_settings_v8_to_v9(payload: dict[str, Any]) -> dict[str, Any]:
     migrated = dict(payload)
     mcp_config = migrated.get("mcp_config")
     if isinstance(mcp_config, Mapping):
-        dropped = sorted(
-            name
-            for name, server in mcp_config.items()
-            if isinstance(server, Mapping)
-            and not server.get("command")
-            and not server.get("url")
-        )
-        if dropped:
-            logger.warning(
-                "Dropping stored MCP server(s) with neither 'command' nor 'url': %s",
-                ", ".join(dropped),
-            )
-            migrated["mcp_config"] = {
-                name: server
-                for name, server in mcp_config.items()
-                if name not in dropped
-            }
+        migrated["mcp_config"] = drop_mcp_servers_without_endpoint(mcp_config)
     migrated["schema_version"] = 9
     return migrated
 
