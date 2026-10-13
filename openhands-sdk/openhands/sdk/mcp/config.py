@@ -495,7 +495,10 @@ MCPTransport = Literal["stdio", "http", "streamable-http", "sse"]
 
 
 class MCPServer(_MCPBaseModel):
-    """One MCP server in the settings DataModel."""
+    """One MCP server in the settings DataModel.
+
+    A server needs ``command`` (stdio) or ``url`` (remote).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -547,6 +550,8 @@ class MCPServer(_MCPBaseModel):
             raise ValueError("stdio MCP servers require 'command'")
         if declared_transport in {"http", "streamable-http", "sse"} and not self.url:
             raise ValueError("remote MCP servers require 'url'")
+        if not self.command and not self.url:
+            raise ValueError("MCP servers require 'command' or 'url'")
         if self.auth is not None and self.headers is not None:
             has_authorization_header = any(
                 key.lower() == "authorization" for key in self.headers

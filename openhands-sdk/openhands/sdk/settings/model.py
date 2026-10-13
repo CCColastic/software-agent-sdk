@@ -494,7 +494,7 @@ def _default_llm_settings() -> LLM:
 _RequestT = TypeVar("_RequestT")
 
 type AgentKind = Literal["openhands", "llm", "acp"]
-AGENT_SETTINGS_SCHEMA_VERSION = 8
+AGENT_SETTINGS_SCHEMA_VERSION = 9
 CONVERSATION_SETTINGS_SCHEMA_VERSION = 1
 
 
@@ -760,6 +760,44 @@ def _migrate_agent_settings_v7_to_v8_request(
 ) -> dict[str, Any]:
     """Advance a request to v8, leaving its switches to be folded as input."""
     return {**payload, "schema_version": 8}
+
+
+def _migrate_agent_settings_v8_to_v9(payload: dict[str, Any]) -> dict[str, Any]:
+    """Drop stored MCP servers that have neither ``command`` nor ``url``.
+
+    Before v9 the settings API stored such a server (``{"enabled": true}``);
+    ``MCPServer`` now rejects it, so drop it with a warning on load instead of
+    failing to load the whole settings file.
+    """
+    migrated = dict(payload)
+    mcp_config = migrated.get("mcp_config")
+    if isinstance(mcp_config, Mapping):
+        dropped = sorted(
+            name
+            for name, server in mcp_config.items()
+            if isinstance(server, Mapping)
+            and not server.get("command")
+            and not server.get("url")
+        )
+        if dropped:
+            logger.warning(
+                "Dropping stored MCP server(s) with neither 'command' nor 'url': %s",
+                ", ".join(dropped),
+            )
+            migrated["mcp_config"] = {
+                name: server
+                for name, server in mcp_config.items()
+                if name not in dropped
+            }
+    migrated["schema_version"] = 9
+    return migrated
+
+
+def _migrate_agent_settings_v8_to_v9_request(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Advance a request to v9; its MCP servers are validated, not dropped."""
+    return {**payload, "schema_version": 9}
 
 
 def _migrate_agent_settings_payload(
@@ -1084,10 +1122,12 @@ _AGENT_SETTINGS_MIGRATIONS: dict[int, PersistedSettingsMigrator] = {
     5: _migrate_agent_settings_v5_to_v6,
     6: _migrate_agent_settings_v6_to_v7,
     7: _migrate_agent_settings_v7_to_v8,
+    8: _migrate_agent_settings_v8_to_v9,
 }
 _REQUEST_AGENT_SETTINGS_MIGRATIONS: dict[int, PersistedSettingsMigrator] = {
     **_AGENT_SETTINGS_MIGRATIONS,
     7: _migrate_agent_settings_v7_to_v8_request,
+    8: _migrate_agent_settings_v8_to_v9_request,
 }
 _CONVERSATION_SETTINGS_MIGRATIONS: dict[int, PersistedSettingsMigrator] = {
     0: _migrate_conversation_settings_v0_to_v1,
