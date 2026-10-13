@@ -23,10 +23,14 @@ in this repository and `verify-openhands` in
 
 ## SDK decisions
 
-- **No launch step.** The SDK runs inside the caller's process, so the
-  "drive" step is the public API through pytest, the example scripts and the
-  integration runner. `sdk-map run` replays the map's `sh` blocks and records
-  a ledger, which is the part of a control CLI this map needs.
+- **A driver, not the unit tests.** The SDK runs inside the caller's
+  process, so there is no server to launch, but the recipes still drive the
+  product: `control-sdk` gives each scenario an isolated run, persisted
+  conversations that each command resumes, short programs that use the public
+  API like the examples, and `--check` on their JSON. Rerunning the unit
+  tests would only repeat CI. A scripted `TestLLM` drives the real agent loop
+  where the model cannot matter; DeepSeek drives it where it can.
+  `sdk-map run` replays the map's `sh` blocks and records a ledger.
 - **Three links per row.** Each sub-feature names its deterministic proof
   (`Unit:`), its real-model demonstration (`Example:`) and its integration
   task (`Real-LLM:`), so a reader sees at once which rows CI checks on every

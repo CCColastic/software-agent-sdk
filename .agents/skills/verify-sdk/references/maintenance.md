@@ -27,7 +27,7 @@ Never edit product code or tests during a maintenance pass.
 ## 1. Freeze the comparison
 
 Record the UTC run time, budget (model, spend), the keys and tools available
-(`LLM_API_KEY`, `tmux`, Docker, Chromium, `node`, `uvx`), and permitted side
+(`DEEPSEEK_API_KEY`, `tmux`, Docker, Chromium, `node`, `uvx`), and permitted side
 effects. Fetch `main` and freeze its full SHA as TARGET. Check
 `git rev-parse --is-shallow-repository`; deepen with a bounded
 `git fetch --depth=...` until BASE is present (an empty log from a shallow
@@ -98,10 +98,10 @@ when a new test or example now covers it.
 ## 5. Replay
 
 Required even when source looks clean. `sdk-map run --all` replays every
-family's deterministic blocks; with `LLM_API_KEY` set it also runs the
-examples and integration commands. Exercise every family at least once and
-every changed behavior through each entry point the family lists (the API
-call, the example, the integration task). Hold three invariants:
+family's scripted blocks; with `DEEPSEEK_API_KEY` set it also runs the live
+blocks, examples and integration commands. Exercise every family at least
+once and every changed behavior through each entry point the family lists
+(the API call, the example, the integration task). Hold three invariants:
 
 1. Never trust a replay of a checkout you have not doctored since its last
    surprise (`sdk-map check`, `uv sync --dev`, the import line in SKILL.md).
@@ -129,7 +129,7 @@ drift too.
 
 For **changed**: one PR of proven corrections. Re-read every changed file,
 run `sdk-map check` and the skill's tests
-(`uv run pytest tests/cross/test_verify_sdk_skill.py`), move the baseline line
+(`uv run pytest tests/cross/test_verify_sdk_skill.py tests/cross/test_control_sdk.py`), move the baseline line
 to TARGET, and put the report (fail and blocked first) and the intent ledger
 in the PR description. For **clean** or **blocked**: no PR; report the outcome
 and coverage honestly.

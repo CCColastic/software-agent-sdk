@@ -6,8 +6,8 @@ description: >
   feature map", or "run the daily SDK map pass". It holds the maintained map
   of what the OpenHands SDK does in-process (agent loop, LLMs, conversations,
   events, condensers, skills, plugins, MCP, hooks, sub-agents, critic,
-  security, tools, workspaces, settings, observability, ACP) and ships
-  sdk-map (check, owners, baseline, run, report).
+  security, tools, workspaces, settings, observability, ACP), the control-sdk
+  driver its recipes use, and sdk-map (check, owners, baseline, run, report).
 triggers:
 - /verify-sdk
 - sdk feature map
@@ -17,24 +17,29 @@ triggers:
 
 The "user" here is a Python program that imports `openhands.sdk` and runs an
 agent in its own process. This skill proves that program's view of the SDK:
-each feature as the public API exposes it, with a deterministic test where one
-exists, an example script with a real model, and the integration runner. The
-agent server is a separate surface with its own skill,
+each recipe builds an agent with the public API, runs it, and checks what came
+out (state, files, events, payloads), with a scripted model where the model
+cannot matter and a real one where it can. It never reruns the unit tests: CI
+does that on every PR, and each row links them on its `Unit:` line. The agent
+server is a separate surface with its own skill,
 [`verify-agent-server`](../verify-agent-server/SKILL.md); what the server adds
 on top of the SDK belongs there.
 
 ## Launch
 
-There is no server. Prepare the checkout once:
+There is no server. Prepare the checkout once, then start a run per scenario:
 
 ```sh
 uv sync --dev
 export PATH="$PWD/.agents/skills/verify-sdk/scripts:$PATH"
+export SDK_VERIFY_RUN=$(control-sdk new --field run)                     # scripted
+export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run) # live
 ```
 
-Model-backed recipes read `LLM_API_KEY`, `LLM_MODEL` and, behind a proxy,
-`LLM_BASE_URL`. Without a key they are skipped and reported `blocked`, never
-passed.
+A run has its own HOME, `OH_PERSISTENCE_DIR`, conversation store, workspace
+and tmux server, and drops the caller's `LLM_*` and `OH_*` variables, so it
+never touches a developer's `~/.openhands`. Live runs read `DEEPSEEK_API_KEY`
+when a model is called; without it they exit 3 and report `blocked`.
 
 ## Doctor
 
@@ -45,6 +50,22 @@ For the environment, `uv run python -c "import openhands.sdk, openhands.tools,
 openhands.workspace"` must succeed.
 
 ## Drive
+
+`control-sdk` does one thing per command and prints JSON; `--check FIELD OP
+VALUE` asserts on it and `--field PATH` prints one value for the shell:
+
+```sh
+CID=$(control-sdk conversation new --script S05/write_and_read.json --field id)
+control-sdk conversation send "$CID" --text "write notes.txt" --run --check execution_status eq finished
+control-sdk conversation events "$CID" --kind ActionEvent --check count eq 4
+control-sdk program S05/reload_events --arg "$CID" --check roundtrip_equal eq true
+control-sdk exec --model-env -- python examples/01_standalone_sdk/01_hello_world.py
+```
+
+Conversations persist in the run, so each command resumes the one before.
+Programs under [`programs/`](programs/) are short scripts like the examples
+that print one JSON result. [references/recipes.md](references/recipes.md)
+explains scripts, programs, live runs and conventions.
 
 Each family file in [the map](references/feature-map/README.md) lists its
 sub-features and a `Driving it` section of bullets, each naming the IDs it
@@ -57,13 +78,13 @@ sdk-map run --file S05 --only S05.event-base            # the bullets that name 
 sdk-map run --all --out "$SDK_VERIFY_HOME/full"         # the whole map
 ```
 
-A bullet passes when every block it ran exits 0. Commands that run an
-example script, `tests/examples/` or the integration runner
-(`tests/integration/run_infer.py`) run only with a model key; the
-deterministic commands in the same block run either way. An integration run
-passes only when its `results.json` shows every requested test succeeded,
-because the runner exits 0 on failed tests. Each block runs in its own
-process group, which is killed when the block ends or times out.
+A bullet passes when every block it ran exits 0; exit 3 means blocked. A block
+that needs a real model (a live run, `--model-env`, an example script or the
+integration runner) runs only with `DEEPSEEK_API_KEY` set and is skipped whole
+otherwise. An integration run passes only when its `results.json` shows every
+requested test succeeded, because the runner exits 0 on failed tests. Each
+block runs in its own process group, which is killed when the block ends or
+times out.
 
 ## Evidence
 
@@ -74,25 +95,25 @@ directory under `$SDK_VERIFY_HOME` (default `$TMPDIR/sdk-verify`) unless
 result per sub-feature, fail first; `--baseline <earlier run>` lists what
 changed since then.
 
-Proof standards: drive the public API a program uses, not internal setters;
-assert state, files and events, never a model's wording; a scripted LLM
-(`TestLLM`) is the deterministic proof, an example or integration run the
-real-model one, and a row says which it got. Unreachable is `blocked` with the
-missing prerequisite, never a pass.
+Proof standards: drive the public API a program uses, not internal setters
+or the unit tests; assert state, files and events, never a model's wording; a
+scripted model (`TestLLM`) through the real agent loop is the deterministic
+proof, a live run, example or integration run the real-model one, and a row
+says which it got (`scripted`, `live`, `example`, `integration`). Unreachable
+is `blocked` with the missing prerequisite, never a pass.
 
 ## Cleanup
 
-Recipes write into temporary directories and `.agent_tmp/`-style working
-directories the examples create. Remove what a recipe created in the
-checkout (`git status` shows it) and keep the run directory: the evidence
-lives there, not in the checkout.
+Recipes write into their run's workspace, under `$SDK_VERIFY_HOME` (default
+`$TMPDIR/sdk-verify`), never the checkout. Keep the run directories while the
+evidence matters; `git status` should show nothing a recipe created.
 
 ## Workflows
 
 - **Verify a change or a PR**: `sdk-map owners --changed origin/main...HEAD`
   maps the changed paths to the families whose `Source:` lines own them, and
   lists product paths no family claims (a map gap). Run those families with
-  `sdk-map run`, plus their examples when a key is available, and report per
+  `sdk-map run`, with `DEEPSEEK_API_KEY` set for the live bullets, and report per
   [the agent-server report contract](../verify-agent-server/references/report.md).
 - **Run the daily pass**: follow [references/daily.md](references/daily.md):
   `sdk-map check`, the families changed since the `Maintenance baseline` line
@@ -108,9 +129,9 @@ lives there, not in the checkout.
 
 - **Map drift**: the map describes something the SDK no longer does by design.
   Fix the entry with current source and a passing recipe.
-- **Harness gap**: the SDK works but no recipe can show it (no test, example
-  or runner reaches it). Mark the row untested, and add a recipe when one is
-  cheap; adding tests to the product is a separate PR.
+- **Harness gap**: the SDK works but no recipe shows it yet. Write the program
+  or `control-sdk` step that does; adding unit tests to the product is a
+  separate PR.
 - **Product bug**: the SDK is broken. Keep the transcript, search existing
   issues, and file it in this repository; mark the bullet's expected result
   with `Known failure (reproduced <date>, #<issue>)`. Never rewrite an expected

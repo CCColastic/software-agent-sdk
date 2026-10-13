@@ -19,9 +19,10 @@ test exercises the behavior; most of those have an example script).
 
 Every sub-feature bullet ends with three links:
 
-- `Unit:` the unit or cross tests that prove it with a deterministic LLM
-  (`openhands.sdk.testing.TestLLM` or mocks). These run on every PR.
-  `**none (untested)**` means a search of `tests/` found nothing.
+- `Unit:` the unit or cross tests that cover it with a deterministic LLM
+  (`openhands.sdk.testing.TestLLM` or mocks). These run on every PR; the map
+  links them for reference and never reruns them. `**none (untested)**` means
+  a search of `tests/` found nothing.
 - `Example:` the example script that shows it with a real model. Examples run
   only on the `test-examples` label (`run-examples.yml`), and the ones in
   `_EXCLUDED_EXAMPLES` (`tests/examples/test_examples.py`) never run in CI.
@@ -30,16 +31,18 @@ Every sub-feature bullet ends with three links:
   only on labels or dispatch.
 
 So a row with a `Unit:` link is checked on every PR, and a row with only an
-`Example:` or `Real-LLM:` link is checked only when someone adds a label.
+`Example:` or `Real-LLM:` link is checked only when someone adds a label. The
+map's own recipes are a third, independent proof: programs that use the SDK
+the way a user's program does (see [recipes.md](../recipes.md)).
 
 ## Baseline preconditions
 
 - `uv sync --dev` has run in the repository root.
-- Model-backed bullets: `LLM_API_KEY` and `LLM_MODEL` are exported (and
-  `LLM_BASE_URL` when using a proxy). Examples read these.
-- Run commands from the repository root. `uv run` reads stdin, so redirect it
-  (`< /dev/null`) when looping over commands.
-- `sdk-map` is on `PATH`:
+- Live bullets: `DEEPSEEK_API_KEY` is exported. `control-sdk new --llm
+  deepseek-flash` runs use it, and `control-sdk exec --model-env` hands it to
+  examples and the integration runner as `LLM_API_KEY`/`LLM_MODEL`.
+- Run commands from the repository root.
+- `control-sdk` and `sdk-map` are on `PATH`:
   `export PATH="$PWD/.agents/skills/verify-sdk/scripts:$PATH"`.
   `sdk-map run --file Snn` replays a family's `sh` blocks into a ledger.
 
@@ -53,17 +56,16 @@ sections: `Sub-features`, `How to get to it (agent POV)`, `Driving it`
 (starting with `Preconditions:`), and `Gotchas`. This is the #5621 contract
 with `Routes:` replaced by `Examples:` and `Driving it with
 control-agent-server` replaced by `Driving it`, because there is no server to
-launch: the `sh` blocks call `uv run pytest` and `uv run python examples/...`
-directly, and `sdk-map run` replays them. Each `Driving it` bullet names the
+launch: the `sh` blocks drive the SDK in-process with `control-sdk` (a run,
+persisted conversations, programs under `programs/`), and `sdk-map run`
+replays them. A block never calls `pytest`. Each `Driving it` bullet names the
 sub-feature IDs it proves in its bold label (`Snn.prefix-*` covers every ID
 with that prefix), and a label that says "blocked" is reported, not run;
 `sdk-map check` fails when a sub-feature has no bullet or a cited path is
-gone.
+gone, or a `control-sdk` call does not parse or names a missing program.
 
-Every `uv run pytest` command in a `Driving it` block was run on 2026-10-11
-and passes. No example and no real-LLM test was run (no model key in that
-environment), and bullets that need Docker, Apptainer, a cloud account, a
-Kubernetes cluster, Chromium or an interactive login are labeled **blocked**.
+Bullets that need Docker, Apptainer, a cloud account, a Kubernetes cluster or
+an interactive login are labeled **blocked**.
 
 ## Families
 

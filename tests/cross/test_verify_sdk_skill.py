@@ -103,6 +103,7 @@ def demo_map(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(sdk_map, "FEATURE_MAP_DIR", feature_map)
     monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     return feature_map
 
 
@@ -154,7 +155,7 @@ def test_run_records_pass_fail_blocked_and_skips_model_blocks(
     assert results["S98.broken"]["result"] == "fail"
     assert "before" in Path(results["S98.broken"]["transcript"]).read_text()
     assert results["S98.model"]["result"] == "blocked"
-    assert "no LLM_API_KEY" in results["S98.model"]["note"]
+    assert "no DEEPSEEK_API_KEY" in results["S98.model"]["note"]
     assert results["S98.gated"]["result"] == "blocked"
     ledger = [
         json.loads(line) for line in (out_dir / "ledger.jsonl").read_text().splitlines()
@@ -280,22 +281,51 @@ def _bullet_map(demo_map, block, ids="`S98.ok`"):
     )
 
 
-def test_mixed_blocks_run_their_deterministic_commands_without_a_key(
+def test_a_block_that_needs_a_model_is_skipped_whole_without_a_key(
     demo_map, tmp_path, capsys
 ):
+    """The block's commands share one run; half of it would prove nothing."""
     _bullet_map(
         demo_map,
-        "test 1 = 1\nuv run python examples/01_standalone_sdk/01_hello_world.py",
+        "export SDK_VERIFY_RUN=$(control-sdk new --llm deepseek-flash --field run)\n"
+        "echo ran-the-scripted-half",
     )
     code, out = _run(
         capsys, "run", "--file", "S98", "--only", "S98.ok", "--out", str(tmp_path / "r")
     )
     (row,) = out["results"]
-    assert row["result"] == "pass"
-    assert row["proof"] == ["deterministic"]
-    assert "1 model-backed command(s) skipped" in row["note"]
-    transcript = Path(row["transcript"]).read_text()
-    assert "examples/01_standalone_sdk" not in transcript
+    assert row["result"] == "blocked"
+    assert "1 model-backed block(s) skipped" in row["note"]
+
+
+def test_exit_3_means_blocked_not_failed(demo_map, tmp_path, capsys):
+    _bullet_map(demo_map, "echo missing key\nexit 3")
+    code, out = _run(
+        capsys, "run", "--file", "S98", "--only", "S98.ok", "--out", str(tmp_path / "r")
+    )
+    (row,) = out["results"]
+    assert row["result"] == "blocked"
+    assert "exit 3" in row["note"]
+
+
+def test_check_rejects_pytest_and_broken_control_sdk_calls(demo_map, capsys):
+    _bullet_map(
+        demo_map,
+        "uv run pytest tests/sdk -q\n"
+        "control-sdk conversation sned x\n"
+        "control-sdk program S98/nowhere --check ok eq true\n"
+        "control-sdk conversation new --script S98/missing.json --field id\n"
+        "control-sdk conversation send \"$CID\" --text hi --run \\\n"
+        "  --check execution_status eq finished",
+    )
+    code, out = _run(capsys, "check", "--file", "S98")
+    assert code == 1
+    problems = "\n".join(out["problems"]["S98-demo.md"])
+    assert "runs pytest" in problems
+    assert "`control-sdk conversation sned x` does not parse" in problems
+    assert "no program programs/S98/nowhere.py" in problems
+    assert "no script programs/S98/missing.json" in problems
+    assert "conversation send" not in problems
 
 
 FAKE_RUN_INFER = """
