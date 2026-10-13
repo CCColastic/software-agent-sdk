@@ -136,7 +136,7 @@ class TestHooksRouter:
 
 
 class TestHooksRouterUserHooks:
-    """The route merges user hooks unless load_user is false."""
+    """The route merges user hooks unless load_user_hooks is false."""
 
     @staticmethod
     def _write(path: Path, command: str) -> None:
@@ -178,10 +178,11 @@ class TestHooksRouterUserHooks:
         self._write(user_dir / "hooks.json", "echo user")
 
         no_user = client.post(
-            "/api/hooks", json={"project_dir": str(project), "load_user": False}
+            "/api/hooks", json={"project_dir": str(project), "load_user_hooks": False}
         ).json()["hook_config"]
         no_project = client.post(
-            "/api/hooks", json={"project_dir": str(project), "load_project": False}
+            "/api/hooks",
+            json={"project_dir": str(project), "load_project_hooks": False},
         ).json()["hook_config"]
 
         assert [m["hooks"][0]["command"] for m in no_user["pre_tool_use"]] == [

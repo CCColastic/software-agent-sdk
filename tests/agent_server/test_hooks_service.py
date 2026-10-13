@@ -4,11 +4,11 @@ import json
 import tempfile
 from pathlib import Path
 
-from openhands.agent_server.hooks_service import load_hooks, load_hooks_from_workspace
+from openhands.agent_server.hooks_service import load_hooks
 
 
-class TestLoadHooksFromWorkspace:
-    """Tests for load_hooks_from_workspace function."""
+class TestLoadProjectHooks:
+    """Tests for loading project hooks only."""
 
     def test_load_hooks_success(self):
         """Test loading hooks from a valid hooks.json file."""
@@ -32,7 +32,7 @@ class TestLoadHooksFromWorkspace:
             }
             hooks_file.write_text(json.dumps(hooks_data))
 
-            result = load_hooks_from_workspace(project_dir=tmpdir)
+            result = load_hooks(project_dir=tmpdir, load_user_hooks=False)
 
             assert result is not None
             assert not result.is_empty()
@@ -41,12 +41,12 @@ class TestLoadHooksFromWorkspace:
     def test_load_hooks_file_not_found(self):
         """Test loading hooks when hooks.json does not exist."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            result = load_hooks_from_workspace(project_dir=tmpdir)
+            result = load_hooks(project_dir=tmpdir, load_user_hooks=False)
             assert result is None
 
     def test_load_hooks_no_project_dir(self):
         """Test loading hooks with no project_dir provided."""
-        result = load_hooks_from_workspace(project_dir=None)
+        result = load_hooks(project_dir=None, load_user_hooks=False)
         assert result is None
 
     def test_load_hooks_empty_hooks(self):
@@ -58,7 +58,7 @@ class TestLoadHooksFromWorkspace:
             hooks_file = openhands_dir / "hooks.json"
             hooks_file.write_text("{}")
 
-            result = load_hooks_from_workspace(project_dir=tmpdir)
+            result = load_hooks(project_dir=tmpdir, load_user_hooks=False)
             assert result is None
 
     def test_load_hooks_invalid_json(self):
@@ -70,7 +70,7 @@ class TestLoadHooksFromWorkspace:
             hooks_file = openhands_dir / "hooks.json"
             hooks_file.write_text("not valid json {")
 
-            result = load_hooks_from_workspace(project_dir=tmpdir)
+            result = load_hooks(project_dir=tmpdir, load_user_hooks=False)
             assert result is None
 
     def test_load_hooks_multiple_event_types(self):
@@ -101,7 +101,7 @@ class TestLoadHooksFromWorkspace:
             }
             hooks_file.write_text(json.dumps(hooks_data))
 
-            result = load_hooks_from_workspace(project_dir=tmpdir)
+            result = load_hooks(project_dir=tmpdir, load_user_hooks=False)
 
             assert result is not None
             assert not result.is_empty()
@@ -136,7 +136,7 @@ class TestLoadHooksFromWorkspace:
             }
             hooks_file.write_text(json.dumps(hooks_data))
 
-            result = load_hooks_from_workspace(project_dir=tmpdir)
+            result = load_hooks(project_dir=tmpdir, load_user_hooks=False)
 
             assert result is not None
             assert not result.is_empty()
@@ -192,14 +192,18 @@ class TestLoadHooks:
         _write_hooks(project / ".openhands" / "hooks.json", "echo project")
         _write_hooks(user_dir / "hooks.json", "echo user")
 
-        only_project = load_hooks(project_dir=str(project), load_user=False)
-        only_user = load_hooks(project_dir=str(project), load_project=False)
+        only_project = load_hooks(project_dir=str(project), load_user_hooks=False)
+        only_user = load_hooks(project_dir=str(project), load_project_hooks=False)
 
         assert only_project is not None and only_user is not None
         assert [m.hooks[0].command for m in only_project.stop] == ["echo project"]
         assert [m.hooks[0].command for m in only_user.stop] == ["echo user"]
         assert (
-            load_hooks(project_dir=str(project), load_project=False, load_user=False)
+            load_hooks(
+                project_dir=str(project),
+                load_project_hooks=False,
+                load_user_hooks=False,
+            )
             is None
         )
 
@@ -226,9 +230,9 @@ class TestLoadHooks:
         assert result is not None
         assert [m.hooks[0].command for m in result.stop] == ["echo project"]
 
-    def test_workspace_loader_ignores_user_hooks(self, tmp_path, monkeypatch):
+    def test_load_user_hooks_false_ignores_user_hooks(self, tmp_path, monkeypatch):
         user_dir = tmp_path / "user"
         monkeypatch.setenv("OH_PERSISTENCE_DIR", str(user_dir))
         _write_hooks(user_dir / "hooks.json", "echo user")
 
-        assert load_hooks_from_workspace(project_dir=str(tmp_path)) is None
+        assert load_hooks(project_dir=str(tmp_path), load_user_hooks=False) is None

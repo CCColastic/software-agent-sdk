@@ -8,6 +8,7 @@ Hook Sources:
 - User hooks: ~/.openhands/hooks.json (or $OH_PERSISTENCE_DIR/hooks.json)
 """
 
+from contextlib import suppress
 from pathlib import Path
 
 from openhands.sdk.hooks import HookConfig
@@ -20,30 +21,31 @@ logger = get_logger(__name__)
 
 def load_hooks(
     project_dir: str | None = None,
-    load_project: bool = True,
-    load_user: bool = True,
+    load_project_hooks: bool = True,
+    load_user_hooks: bool = True,
 ) -> HookConfig | None:
     """Load project and user hooks, merged.
 
-    Project hooks come first, so their handlers run before user handlers for
-    the same event. A project dir whose ``.openhands/hooks.json`` is the user
-    hooks file is read once.
+    Unlike ``HookConfig.load()``, which reads the first hooks file it finds,
+    this reads both sources and merges them. Project hooks come first, so
+    their handlers run before user handlers for the same event. A project dir
+    whose ``.openhands/hooks.json`` is the user hooks file is read once.
 
     Args:
         project_dir: Workspace directory path for project hooks.
-        load_project: Load ``{project_dir}/.openhands/hooks.json``.
-        load_user: Load the user hooks file, ``~/.openhands/hooks.json``.
+        load_project_hooks: Load ``{project_dir}/.openhands/hooks.json``.
+        load_user_hooks: Load the user hooks file, ``~/.openhands/hooks.json``.
 
     Returns:
         The merged HookConfig, or None if no source has hooks.
     """
     paths: list[Path] = []
-    if load_project:
+    if load_project_hooks:
         if project_dir:
             paths.append(Path(project_dir) / ".openhands" / "hooks.json")
         else:
             logger.debug("No project_dir provided, skipping project hooks")
-    if load_user:
+    if load_user_hooks:
         user_path = get_user_persistence_dir() / "hooks.json"
         if not any(_same_file(user_path, p) for p in paths):
             paths.append(user_path)
@@ -52,23 +54,10 @@ def load_hooks(
     return HookConfig.merge(configs)
 
 
-def load_hooks_from_workspace(project_dir: str | None = None) -> HookConfig | None:
-    """Load hooks from the workspace .openhands/hooks.json file only.
-
-    Args:
-        project_dir: Workspace directory path for project hooks.
-
-    Returns:
-        HookConfig if hooks.json exists and is valid, None otherwise.
-    """
-    return load_hooks(project_dir=project_dir, load_project=True, load_user=False)
-
-
 def _same_file(a: Path, b: Path) -> bool:
-    try:
+    with suppress(OSError):
         return a.resolve() == b.resolve()
-    except OSError:
-        return False
+    return False
 
 
 def _load_hooks_file(hooks_path: Path) -> HookConfig | None:

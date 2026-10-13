@@ -64,7 +64,8 @@ Routes: `GET /api/tools/`, `GET /api/tools/catalog`, `POST /api/sub-agents`,
   (`HooksRequest`) returns `{"hook_config": HookConfig | null}`: the
   handlers of `<project_dir>/.openhands/hooks.json`, then those of the user
   hooks file (`$OH_PERSISTENCE_DIR/hooks.json`, else `~/.openhands/hooks.json`).
-  `load_project` and `load_user` (both default `true`) pick the sources.
+  `load_project_hooks` and `load_user_hooks` (both default `true`) pick the
+  sources.
   Driven by the `F27.hooks-*` bullets, which run with no user hooks file.
 - REST, conversations (second view, owned by the conversation family):
   `StartConversationRequest.hook_config` carries the returned config into
