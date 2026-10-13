@@ -522,6 +522,19 @@ class TestCloneRepos:
         assert fetched == ["GITHUB_TOKEN", "github_token"]
 
     @patch("subprocess.run")
+    def test_clone_prefers_uppercase_token_name(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+        tokens = {"GITHUB_TOKEN": "current-token", "github_token": "legacy-token"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repos = [RepoSource(url="owner/repo", provider="github")]
+            clone_repos(repos, Path(tmpdir), token_fetcher=tokens.get)
+
+        clone_cmd = " ".join(str(arg) for arg in mock_run.call_args[0][0])
+        assert "current-token" in clone_cmd
+        assert "legacy-token" not in clone_cmd
+
+    @patch("subprocess.run")
     def test_clone_with_provider_specific_token(self, mock_run):
         """Test clone fetches correct token based on provider."""
         mock_run.return_value = MagicMock(returncode=0, stderr="")
