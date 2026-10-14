@@ -1410,13 +1410,16 @@ def test_archive_format_description_matches_single_nested_repo(client, tmp_path)
     assert "proj/README.md" in names
     assert not any(name.endswith("top.txt") for name in names)
 
-    params = client.get("/openapi.json").json()["paths"]["/api/file/archive"]["get"][
-        "parameters"
-    ]
-    descriptions = {p["name"]: p["description"] for p in params}
-    assert "entire directory" not in descriptions["format"]
-    for name in ("format", "path"):
-        assert "exactly one git repository" in descriptions[name]
+    paths = client.get("/openapi.json").json()["paths"]
+    for route in (
+        "/api/file/archive",
+        "/api/conversations/{runtime_conversation_id}/file/archive",
+    ):
+        params = paths[route]["get"]["parameters"]
+        descriptions = {p["name"]: p.get("description", "") for p in params}
+        assert "entire directory" not in descriptions["format"]
+        for name in ("format", "path"):
+            assert "exactly one git repository" in descriptions[name]
 
 
 def test_archive_remote_with_embedded_control_char_is_percent_encoded(client, tmp_path):

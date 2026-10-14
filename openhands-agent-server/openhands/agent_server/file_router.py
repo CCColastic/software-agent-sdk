@@ -962,10 +962,12 @@ async def archive_directory(
                 "Archive format: 'git-delta' for a git patch of the working-tree "
                 "changes against a base ref (requires a git repository); 'tar.gz' "
                 "for a gzip tarball of the files (works on non-git directories "
-                "too). Both archive the resolved directory: a non-repository "
-                "path holding exactly one git repository (up to three levels "
-                "down) is archived as that repository, so files beside it are "
-                "not included."
+                "too). Both formats archive the directory at path, except that "
+                "a non-repository path holding exactly one git repository (up "
+                "to three levels down, skipping hidden and vendored "
+                "directories) is archived as that repository, so files beside "
+                "it are not included; with zero or several repositories the "
+                "directory is archived as given."
             ),
         ),
     ] = "git-delta",
