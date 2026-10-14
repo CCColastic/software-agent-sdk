@@ -363,7 +363,14 @@ async def api_lifespan(api: FastAPI) -> AsyncIterator[None]:
         if tmux_tmpdir_was_created:
             # Only the per-server directory this process created; a
             # user-provided TMUX_TMPDIR is never removed.
-            shutil.rmtree(tmux_tmpdir, ignore_errors=True)
+            try:
+                shutil.rmtree(tmux_tmpdir)
+            except OSError as e:
+                logger.warning(
+                    "Failed to remove per-server tmux directory %s: %s",
+                    tmux_tmpdir,
+                    e,
+                )
 
 
 def _emit_request_failed(request: Request, exc: Exception, error_id: str) -> None:
