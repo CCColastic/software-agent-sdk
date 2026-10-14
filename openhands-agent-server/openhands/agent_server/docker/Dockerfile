@@ -127,6 +127,71 @@ RUN set -eux; \
     fetch openvscode socks@2.8.10 ip-address@10.3.1; \
     rm -rf /root/.npm
 
+####################################################################################
+# Source-built CLI tools
+#
+# The latest gh, Docker Buildx, and Docker Compose releases still ship Go
+# binaries with vulnerable embedded modules. Build those releases with patched
+# Go toolchains/modules until upstream publishes rebuilt binaries.
+####################################################################################
+FROM golang:1.27.2-bookworm AS github-cli-source
+ARG GH_CLI_VERSION=v2.102.0
+ARG GH_CLI_REVISION=fc4b137cdef0a6bd28fd461b7cf9c84a5812a8cd
+WORKDIR /src
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    set -eux; \
+    git init .; \
+    git remote add origin https://github.com/cli/cli.git; \
+    git fetch --depth 1 origin "${GH_CLI_REVISION}" "refs/tags/${GH_CLI_VERSION}:refs/tags/${GH_CLI_VERSION}"; \
+    test "$(git rev-parse "${GH_CLI_VERSION}^{commit}")" = "${GH_CLI_REVISION}"; \
+    git checkout --detach FETCH_HEAD; \
+    test "$(git rev-parse HEAD)" = "${GH_CLI_REVISION}"; \
+    go mod edit -go=1.27.2 -toolchain=none -require=golang.org/x/net@v0.60.0; \
+    go mod tidy; \
+    BUILD_DATE=$(TZ=UTC git show -s --format=%cd --date=format-local:%Y-%m-%d HEAD); \
+    mkdir -p /out; \
+    CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X github.com/cli/cli/v2/internal/build.Version=${GH_CLI_VERSION#v} -X github.com/cli/cli/v2/internal/build.Date=${BUILD_DATE}" -o /out/gh ./cmd/gh; \
+    /out/gh --version
+
+FROM golang:1.26.9-bookworm AS docker-buildx-source
+ARG DOCKER_BUILDX_VERSION=v0.38.0
+ARG DOCKER_BUILDX_REVISION=0dbe87f36ed472fe36b6796c3f70b4210a731fc5
+WORKDIR /src
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    set -eux; \
+    git init .; \
+    git remote add origin https://github.com/docker/buildx.git; \
+    git fetch --depth 1 origin "${DOCKER_BUILDX_REVISION}" "refs/tags/${DOCKER_BUILDX_VERSION}:refs/tags/${DOCKER_BUILDX_VERSION}"; \
+    test "$(git rev-parse "${DOCKER_BUILDX_VERSION}^{commit}")" = "${DOCKER_BUILDX_REVISION}"; \
+    git checkout --detach FETCH_HEAD; \
+    test "$(git rev-parse HEAD)" = "${DOCKER_BUILDX_REVISION}"; \
+    go mod edit -go=1.26.9 -toolchain=none -require=golang.org/x/net@v0.60.0 -require=github.com/moby/go-archive@v0.3.0; \
+    go mod download golang.org/x/net github.com/moby/go-archive; \
+    mkdir -p /out; \
+    CGO_ENABLED=0 GOFLAGS=-mod=mod go build -trimpath -ldflags "-s -w -X github.com/docker/buildx/version.Version=${DOCKER_BUILDX_VERSION} -X github.com/docker/buildx/version.Revision=${DOCKER_BUILDX_REVISION} -X github.com/docker/buildx/version.Package=github.com/docker/buildx" -o /out/docker-buildx ./cmd/buildx; \
+    /out/docker-buildx version
+
+FROM golang:1.26.9-bookworm AS docker-compose-source
+ARG DOCKER_COMPOSE_VERSION=v5.6.0
+ARG DOCKER_COMPOSE_REVISION=42f48072bbf92ee9b0e43f9fdf2008d03546e7ca
+WORKDIR /src
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    set -eux; \
+    git init .; \
+    git remote add origin https://github.com/docker/compose.git; \
+    git fetch --depth 1 origin "${DOCKER_COMPOSE_REVISION}" "refs/tags/${DOCKER_COMPOSE_VERSION}:refs/tags/${DOCKER_COMPOSE_VERSION}"; \
+    test "$(git rev-parse "${DOCKER_COMPOSE_VERSION}^{commit}")" = "${DOCKER_COMPOSE_REVISION}"; \
+    git checkout --detach FETCH_HEAD; \
+    test "$(git rev-parse HEAD)" = "${DOCKER_COMPOSE_REVISION}"; \
+    go mod edit -go=1.26.9 -toolchain=none -require=golang.org/x/net@v0.60.0; \
+    go mod tidy; \
+    mkdir -p /out; \
+    CGO_ENABLED=0 go build -trimpath -tags e2e -ldflags "-s -w -X github.com/docker/compose/v5/internal.Version=${DOCKER_COMPOSE_VERSION}" -o /out/docker-compose ./cmd; \
+    /out/docker-compose version
+
 FROM debian:trixie-slim AS python-node-runtime
 ARG NPM_VERSION
 ARG DEBIAN_SNAPSHOT=20261012T234422Z
@@ -638,8 +703,21 @@ RUN set -eux; \
     rm -rf "$tmpdir"; \
     test "$(rootlesskit --version)" = "rootlesskit version 3.3.0"
 
+RUN --mount=type=bind,from=docker-buildx-source,source=/out/docker-buildx,target=/tmp/docker-buildx \
+    --mount=type=bind,from=docker-compose-source,source=/out/docker-compose,target=/tmp/docker-compose \
+    set -eux; \
+    case ",$INSTALL_CAPABILITIES," in \
+      *,docker,*) ;; \
+      *) exit 0;; \
+    esac; \
+    install -m 0755 /tmp/docker-buildx /usr/libexec/docker/cli-plugins/docker-buildx; \
+    install -m 0755 /tmp/docker-compose /usr/libexec/docker/cli-plugins/docker-compose; \
+    docker buildx version; \
+    docker compose version
+
 # --- GitHub CLI ---
-RUN set -eux; \
+RUN --mount=type=bind,from=github-cli-source,source=/out/gh,target=/tmp/gh \
+    set -eux; \
     mkdir -p -m 755 /etc/apt/keyrings; \
     wget -nv -O /etc/apt/keyrings/githubcli-archive-keyring.gpg \
         https://cli.github.com/packages/githubcli-archive-keyring.gpg; \
@@ -648,6 +726,8 @@ RUN set -eux; \
         > /etc/apt/sources.list.d/github-cli.list; \
     apt-get update; \
     apt-get install -y gh; \
+    install -m 0755 /tmp/gh /usr/bin/gh; \
+    gh --version; \
     apt-get clean; \
     rm -rf /var/lib/apt/lists/*
 
