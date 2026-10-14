@@ -295,6 +295,7 @@ def test_get_vscode_url_with_token(vscode_service):
 def test_get_vscode_url_folder_round_trips(vscode_service, workspace_dir):
     """The folder parameter decodes back to the exact workspace path."""
     vscode_service.connection_token = "test-token-123"
+    vscode_service.process = MagicMock(returncode=None)  # running
 
     url = vscode_service.get_vscode_url(workspace_dir=workspace_dir)
 
@@ -310,6 +311,7 @@ def test_get_vscode_url_folder_round_trips(vscode_service, workspace_dir):
 def test_get_vscode_url_keeps_slashes_readable(vscode_service):
     """Path separators in the folder parameter are not percent-encoded."""
     vscode_service.connection_token = "test-token-123"
+    vscode_service.process = MagicMock(returncode=None)  # running
 
     url = vscode_service.get_vscode_url(workspace_dir="/tmp/qa f16&x=1#frag")
 
