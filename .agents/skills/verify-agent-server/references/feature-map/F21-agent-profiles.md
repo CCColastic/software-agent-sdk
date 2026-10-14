@@ -130,8 +130,9 @@ Preconditions:
   restarts the run twice (with `OH_ACP_SKILL_SOURCING=openhands_managed`,
   then with `--reset-config`). `F21.store-busy`, `F21.launch-store-busy`
   and `F21.busy-blocks-server` hold the store lock for about 30 seconds
-  each. The four known-bug bullets come last; `F21.json-suffix-identity`
-  stays last because it leaves a profile and a dangling pointer behind.
+  each. The three known-bug bullets come last, then
+  `F21.json-suffix-identity`, which activates its own profile and ends by
+  deleting it, so the run is left with no active profile.
 
 ```sh
 control-agent-server llm preset deepseek
@@ -956,9 +957,9 @@ printf -- '---\nname: qa-f21-skill\ndescription: QA F21 user skill\n---\nQA_F21_
   `acp_startup_timeout`. `tsc` names the first undeclared field of each
   literal (`resolved_mcp_config_keys`, `disabled_skills`,
   `acp_startup_timeout`). The summary type matches.
-- **`.json` names lose their identity (`F21.json-suffix-identity`), known bug.**
-  The store strips a trailing `.json` from the file name but keeps it in the
-  profile's `name`.
+- **`.json` names keep their identity (`F21.json-suffix-identity`).**
+  The store strips a trailing `.json` from the file name and from the
+  profile's `name`, so `x.json` and `x` are one profile.
   ```sh
   if control-agent-server api POST /api/agent-profiles/qa-f21-suffix.json --json '{"llm_profile_ref": "deepseek-flash"}' --expect 201 --quiet; then
     J1=$(control-agent-server api GET /api/agent-profiles/qa-f21-suffix.json --check profile.revision eq 0 \
@@ -967,27 +968,22 @@ printf -- '---\nname: qa-f21-skill\ndescription: QA F21 user skill\n---\nQA_F21_
     control-agent-server api POST /api/agent-profiles/qa-f21-suffix.json --json '{"llm_profile_ref": "deepseek-pro"}' --expect 201
     control-agent-server api GET /api/agent-profiles/qa-f21-suffix.json --check profile.llm_profile_ref eq deepseek-pro \
       --save F21.json-suffix-identity/after-overwrite
-    control-agent-server api GET /api/agent-profiles/qa-f21-suffix.json --check profile.id eq "$J1" --check profile.revision eq 1  # bug: status eq 200 && checks.0.ok eq false && response.body.profile.revision eq 0
+    control-agent-server api GET /api/agent-profiles/qa-f21-suffix.json --check profile.id eq "$J1" --check profile.revision eq 1
     control-agent-server api DELETE /api/agent-profiles/qa-f21-suffix.json --expect 200
-    control-agent-server api GET /api/settings --check active_agent_profile_id missing  # bug: status eq 200 && response.body.active_agent_profile_id exists
+    control-agent-server api GET /api/settings --check active_agent_profile_id missing
   else
     control-agent-server api POST /api/agent-profiles/qa-f21-suffix.json --json '{"llm_profile_ref": "deepseek-flash"}' --expect 422
     control-agent-server state ls 'home/.openhands/agent-profiles/qa-f21-suffix*' --expect-count 0
   fi
   ```
-  Correct behavior: the overwrite keeps `J1` and moves to revision 1, and
-  deleting the active profile clears the pointer; or (the `else` branch, for
-  a fix that refuses the name) the save is 422 and stores nothing. The
-  arrange steps first prove the overwrite landed (the second GET serves
-  `deepseek-pro`). Today the file is `qa-f21-suffix.json`, the list shows it
-  as `qa-f21-suffix` (which GET also serves), and the identity lookup by the
-  full name misses, so the overwrite mints a new id at revision 0 and the
-  bullet stops at the first `# bug` line; the active pointer is left on
-  `J1`, which no profile carries any more. The second `# bug` line (DELETE
-  must clear that pointer, which today it does not, because DELETE looks
-  the id up by the full name too) is reached once the identity is fixed.
-  This bullet stays last: it leaves the profile and the dangling pointer
-  behind.
+  The overwrite keeps `J1` and moves to revision 1, and deleting the active
+  profile clears the pointer; or (the `else` branch, for a server that
+  refuses the name) the save is 422 and stores nothing. The arrange steps
+  first prove the overwrite landed (the second GET serves `deepseek-pro`).
+  The stored and listed name is `qa-f21-suffix` (the file stem), and the
+  identity lookup and DELETE compare against that name, so the `.json`
+  spelling reaches the same id. This bullet stays last: it leaves the run
+  with no active profile.
 
 ## Gotchas
 
