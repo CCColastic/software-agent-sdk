@@ -18,7 +18,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from pydantic import SecretStr
 
@@ -246,7 +246,7 @@ DEFAULT_PERSISTENCE_DIR = Path("workspace/.openhands")
 
 
 # Appended to the "different key" refusals of read-modify-write paths.
-_KEY_HINT = (
+_KEY_HINT: Final[str] = (
     "restore the key it was saved under as OH_SECRET_KEY, or add it to "
     "OH_PREVIOUS_SECRET_KEYS"
 )
