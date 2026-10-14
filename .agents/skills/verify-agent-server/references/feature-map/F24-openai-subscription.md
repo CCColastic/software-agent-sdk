@@ -467,9 +467,11 @@ Preconditions:
   EXP5=$(bash "$F24/write-login.sh" "$OFF" 3600000)
   control-agent-server api GET /api/llm/subscription/openai/status --run "$OFF" --expect 200 --check connected eq true \
     --check expires_at eq "$EXP5"
-  bash "$F24/write-login.sh" "$OFF" -1000 >/dev/null
+  EXP6=$(bash "$F24/write-login.sh" "$OFF" -1000)
   control-agent-server api GET /api/llm/subscription/openai/status --run "$OFF" --expect 200 --check connected eq false \
     --save F24.status-offline/status
+  control-agent-server state cat --run "$OFF" home/.openhands/auth/openai_oauth.json --check expires_at eq "$EXP6" \
+    --check refresh_token eq qa-f24-refresh-token
   control-agent-server logs --run "$OFF" --grep 'Refreshing OpenAI access token' --expect-min 1
   control-agent-server logs --run "$OFF" --grep 'Unhandled exception on GET' --expect-none
   ```
@@ -479,7 +481,7 @@ Preconditions:
   `Unhandled exception on POST`, `F24.device-start-offline`).
   `get_openai_subscription_status` treats an httpx transport error from
   `refresh_if_needed()` like a rejected refresh (`llm_router.py`); the
-  stored login stays on disk, so status retries the refresh once the
+  stored file is left as it was, so status retries the refresh once the
   network returns.
 - **Start and poll a login offline (`F24.device-start-offline`), known bug.**
   A second run behind `netgate`: start a login while online and see it
