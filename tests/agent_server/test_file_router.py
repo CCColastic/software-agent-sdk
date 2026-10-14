@@ -58,7 +58,7 @@ def test_upload_file_query_param_success(client, tmp_path):
     )
 
     assert response.status_code == 200
-    assert response.json() == {"success": True}
+    assert response.json() == {"success": True, "file_size": len(file_content)}
     assert target_path.exists()
     assert target_path.read_bytes() == file_content
 
@@ -294,6 +294,7 @@ def test_upload_large_file_chunked(client, tmp_path):
     )
 
     assert response.status_code == 200
+    assert response.json()["file_size"] == len(large_content)
     assert target_path.exists()
     assert target_path.read_bytes() == large_content
 
@@ -311,6 +312,7 @@ def test_upload_overwrites_existing_file(client, tmp_path):
     )
 
     assert response.status_code == 200
+    assert response.json()["file_size"] == len(new_content)
     assert target_path.read_bytes() == new_content
 
 
