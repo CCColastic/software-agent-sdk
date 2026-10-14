@@ -125,6 +125,23 @@ def test_get_git_diff_missing_path_that_is_a_directory_at_base():
             run_in_directory(temp_dir, get_git_diff, "never_existed.txt")
 
 
+def test_get_git_diff_deleted_file_too_large():
+    """A deleted file's base text is held to the same size cap."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        setup_git_repo(temp_dir)
+
+        big = Path(temp_dir) / "big.txt"
+        big.write_text("a" * (1024 * 1024 + 1))
+        run_bash_command("git add .", temp_dir)
+        run_bash_command("git commit -m 'Initial commit'", temp_dir)
+        os.remove(big)
+
+        from openhands.sdk.git.exceptions import GitPathError
+
+        with pytest.raises(GitPathError, match="File too large"):
+            run_in_directory(temp_dir, get_git_diff, "big.txt")
+
+
 def test_get_git_diff_missing_file_outside_repo():
     """A missing path outside any repository still reports a missing file."""
     with tempfile.TemporaryDirectory() as temp_dir:

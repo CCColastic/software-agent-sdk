@@ -50,17 +50,19 @@ def get_closest_git_repo(path: Path) -> Path | None:
         current_path = parent
 
 
-def _is_file_at_ref(repo: Path, ref: str, relative_path: Path) -> bool:
-    """Return whether ``relative_path`` is a file (blob) at ``ref``."""
+def _base_file_size(repo: Path, ref: str, relative_path: Path) -> int | None:
+    """Size of the file (blob) ``relative_path`` at ``ref``, or ``None``
+    when ``ref`` has no file at that path."""
+    spec = f"{ref}:{relative_path.as_posix()}"
     try:
         object_type = run_git_command(
-            ["git", "cat-file", "-t", f"{ref}:{relative_path}"],
-            repo,
-            expected_failure=True,
+            ["git", "cat-file", "-t", spec], repo, expected_failure=True
         )
-    except GitCommandError:
-        return False
-    return object_type == "blob"
+        if object_type != "blob":
+            return None
+        return int(run_git_command(["git", "cat-file", "-s", spec], repo))
+    except (GitCommandError, ValueError):
+        return None
 
 
 def get_git_diff(relative_file_path: str | Path, ref: str | None = None) -> GitDiff:
@@ -126,10 +128,17 @@ def get_git_diff(relative_file_path: str | Path, ref: str | None = None) -> GitD
     except ValueError as e:
         raise GitPathError(f"File is not within git repository: {path}") from e
 
-    if deleted and not _is_file_at_ref(
-        validated_repo, current_rev, relative_path_from_repo
-    ):
-        raise missing_error
+    if deleted:
+        base_size = _base_file_size(
+            validated_repo, current_rev, relative_path_from_repo
+        )
+        if base_size is None:
+            raise missing_error
+        if base_size > MAX_FILE_SIZE_FOR_GIT_DIFF:
+            raise GitPathError(
+                f"File too large for git diff: {base_size} bytes "
+                f"(max: {MAX_FILE_SIZE_FOR_GIT_DIFF} bytes)"
+            )
 
     # Get old content (from the ref)
     try:
