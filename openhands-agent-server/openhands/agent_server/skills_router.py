@@ -493,7 +493,6 @@ def uninstall_skill_endpoint(skill_name: SkillNamePath) -> UninstallSkillRespons
     responses={
         400: {"description": "Failed to fetch the skill's recorded source"},
         404: {"description": "Skill not installed"},
-        422: {"description": "The source no longer holds a valid skill"},
     },
 )
 def refresh_skill_endpoint(skill_name: SkillNamePath) -> UpdateSkillResponse:

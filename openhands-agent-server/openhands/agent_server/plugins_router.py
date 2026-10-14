@@ -339,7 +339,6 @@ def uninstall_plugin_endpoint(plugin_name: PluginNamePath) -> UninstallPluginRes
     responses={
         400: {"description": "Failed to fetch the plugin's recorded source"},
         404: {"description": "Plugin not installed"},
-        422: {"description": "The source no longer holds a valid plugin"},
     },
 )
 def refresh_plugin_endpoint(plugin_name: PluginNamePath) -> UpdatePluginResponse:
