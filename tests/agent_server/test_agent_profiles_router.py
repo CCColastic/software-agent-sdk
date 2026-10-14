@@ -327,15 +327,20 @@ def test_no_seed_when_store_nonempty(client, store):
     assert body["active_agent_profile_id"] is None
 
 
-def test_no_seed_when_pointer_set_but_store_empty(client):
+def test_no_seed_when_pointer_set_but_store_empty(client, store):
     """An empty store with a non-null pointer is left as-is (no seed, no error).
 
     A stale pointer (e.g. after a failed delete) reflects user state, so the
     seed condition deliberately requires both an empty store *and* a null
     pointer.
     """
-    stale = "12345678-1234-1234-1234-1234567890ab"
-    client.patch("/api/settings", json={"active_agent_profile_id": stale})
+    # PATCH /api/settings refuses unknown ids (#5847), so activate a real
+    # profile and then remove its file out of band.
+    profile = OpenHandsAgentProfile(name="gone", llm_profile_ref="x")
+    store.save(profile)
+    stale = str(profile.id)
+    assert client.post(f"/api/agent-profiles/{stale}/activate").status_code == 200
+    (store.base_dir / "gone.json").unlink()
 
     body = client.get("/api/agent-profiles").json()
     assert body["profiles"] == []
