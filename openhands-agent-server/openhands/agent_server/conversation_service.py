@@ -2630,6 +2630,9 @@ class WebhookSubscriber(Subscriber):
                 if not events_remaining and self._buffer_full():
                     # Events published during the POST filled the buffer again.
                     events_remaining = len(self.queue)
+            # A timer started during the POST has nothing left to flush.
+            if not self.queue and self._flush_timer is not asyncio.current_task():
+                self._cancel_flush_timer()
 
     async def _post_batch(self, event_data: list[dict[str, Any]]) -> bool:
         """Post one serialized batch with retry logic."""

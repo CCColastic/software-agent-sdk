@@ -719,7 +719,8 @@ Preconditions:
   `_post_events` re-checks the buffer after it has drained what was queued
   when it started, and keeps posting while it is full again, so those events
   go out right after the in-flight POST instead of after `flush_delay`. The
-  timer still covers a failed POST and a buffer that is not full. It shows
+  timer still covers a failed POST and a buffer that is not full, and is
+  cancelled when the queue drains. It shows
   on every conversation's first message: the `SystemPromptEvent` fills a
   buffer of 2 and the message and its `last_user_message_id` update are
   published during that POST.

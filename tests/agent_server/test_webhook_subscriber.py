@@ -891,8 +891,8 @@ async def test_events_published_during_post_are_sent_once_buffer_is_full(
         # Without waiting for flush_delay (1 h) or close().
         assert [len(batch) for batch in batches] == [2, 2]
         assert subscriber.queue == []
-
-    subscriber._cancel_flush_timer()
+        # The timer started during the first POST is not left running.
+        assert subscriber._flush_timer is None
 
 
 @pytest.mark.asyncio
