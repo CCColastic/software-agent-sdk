@@ -138,6 +138,9 @@ def test_refresh_invalid_manifest_is_422_and_keeps_plugin(
     assert kept.status_code == 200
     assert kept.json()["version"] == "1.0.0"
 
+    _make_installable_plugin(src, "demo-plugin")
+    assert client.post("/plugins/installed/demo-plugin/refresh").status_code == 200
+
 
 def test_refresh_adopted_local_plugin_is_400(client: TestClient, tmp_path: Path):
     store = tmp_path / "installed-store"

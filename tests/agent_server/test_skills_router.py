@@ -827,6 +827,38 @@ class TestRefreshSkillEndpoint:
         assert kept.status_code == 200
         assert kept.json()["enabled"] is True
 
+    def test_refresh_source_without_skill_md_is_422_and_keeps_skill(
+        self, client, tmp_path, monkeypatch
+    ):
+        """A source that no longer holds a SKILL.md is 422, as on install, and
+        a later valid refresh still succeeds."""
+        store = tmp_path / "installed-store"
+        store.mkdir()
+        monkeypatch.setattr(
+            "openhands.sdk.skills.installed.DEFAULT_INSTALLED_SKILLS_DIR", store
+        )
+        src = tmp_path / "broken-skill"
+        src.mkdir()
+        skill_md = "---\nname: broken-skill\ndescription: Becomes invalid\n---\nBody\n"
+        (src / "SKILL.md").write_text(skill_md)
+        assert (
+            client.post("/api/skills/install", json={"source": str(src)}).status_code
+            == 200
+        )
+        (src / "SKILL.md").unlink()
+
+        response = client.post("/api/skills/installed/broken-skill/refresh")
+
+        assert response.status_code == 422
+        kept = client.get("/api/skills/installed/broken-skill")
+        assert kept.status_code == 200
+        assert kept.json()["enabled"] is True
+
+        (src / "SKILL.md").write_text(skill_md)
+        assert (
+            client.post("/api/skills/installed/broken-skill/refresh").status_code == 200
+        )
+
     def test_refresh_fetch_error_returns_400(self, client):
         """A source the SDK cannot parse (e.g. ``local`` for an adopted skill)
         is a client error, not a 500."""
