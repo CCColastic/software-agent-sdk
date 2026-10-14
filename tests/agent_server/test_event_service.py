@@ -1919,6 +1919,33 @@ class TestEventServiceRun:
             await event_service.run()
 
     @pytest.mark.asyncio
+    async def test_run_already_running_does_not_wait_for_state_lock(
+        self, event_service
+    ):
+        """A live run holds the state lock for its whole step (e.g. a long tool
+        call); run() must refuse at once instead of blocking behind it."""
+        lock_released = threading.Event()
+        state = MagicMock(spec=ConversationState)
+        state.execution_status = ConversationExecutionStatus.RUNNING
+        state.__enter__ = MagicMock(
+            side_effect=lambda: (lock_released.wait(10), state)[1]
+        )
+        state.__exit__ = MagicMock(return_value=None)
+        conversation = MagicMock(spec=Conversation)
+        conversation._state = state
+        event_service._conversation = conversation
+
+        run_task = asyncio.create_task(asyncio.Event().wait())
+        event_service._run_task = run_task
+        try:
+            with pytest.raises(ValueError, match="conversation_already_running"):
+                await asyncio.wait_for(event_service.run(), timeout=2)
+            state.__enter__.assert_not_called()
+        finally:
+            lock_released.set()
+            run_task.cancel()
+
+    @pytest.mark.asyncio
     async def test_run_starts_background_task(self, event_service):
         """Test that run starts a background task and returns immediately."""
         conversation = MagicMock(spec=Conversation)
