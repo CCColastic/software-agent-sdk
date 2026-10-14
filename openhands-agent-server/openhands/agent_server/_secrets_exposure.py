@@ -135,7 +135,10 @@ def profile_key_mismatch(name: str, error: SecretDecryptionError) -> HTTPExcepti
     _logger.error(f"Refusing to use profile '{name}': {error}")
     return HTTPException(
         status_code=status.HTTP_409_CONFLICT,
-        detail=f"Profile '{name}' is encrypted with a different key",
+        detail=(
+            f"Profile '{name}' is encrypted with a different key: restore that "
+            "key as OH_SECRET_KEY or add it to OH_PREVIOUS_SECRET_KEYS"
+        ),
     )
 
 

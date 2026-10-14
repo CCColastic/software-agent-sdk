@@ -58,7 +58,8 @@ Routes: `GET /api/profiles`, `GET /api/profiles/{name}`,
 - `F20.delete-guarded`: deleting a profile that an agent profile references is 409 naming the referrer, and the profile stays.
 - `F20.delete`: `DELETE /api/profiles/{name}` removes the file and the list entry and clears `active_profile` in both views, leaves the applied `agent_settings.llm` in place, and answers 200 again for a name that is already gone.
 - `F20.json-alias-guard`: a name with a `.json` suffix addresses the same profile (`GET /api/profiles/<name>.json` reads `<name>`), and deleting through that alias is refused with 409 while an agent profile references `<name>`, as it is for the plain name.
-- `F20.secret-key-rotation`: after the server's secret key changes, activating or re-saving a profile whose stored key can no longer be decrypted is refused (409) instead of silently applying a keyless LLM or overwriting the key.
+- `F20.secret-key-previous-keys`: after a rotation that keeps the old key in `OH_PREVIOUS_SECRET_KEYS`, a profile saved under the old key still reads its key, and once re-saved it reads without the old key.
+- `F20.secret-key-rotation`: after the server's secret key changes and the old key is lost (not in `OH_PREVIOUS_SECRET_KEYS`), activating or re-saving a profile whose stored key can no longer be decrypted is refused (409) instead of silently applying a keyless LLM or overwriting the key.
 
 ## How to get to it (agent POV)
 
@@ -912,8 +913,31 @@ Preconditions:
   without moving `active_profile` or the agent profile's `llm_profile_ref`.
   The bullet removes the agent profile and the (possibly already deleted)
   profile, and checks the list no longer has it, before it fails.
-- **Secret key rotation (`F20.secret-key-rotation`).** Save a
-  profile, restart with a new secret key, then activate and re-save it.
+- **Supported key rotation (`F20.secret-key-previous-keys`).** Save a
+  profile, restart with a new secret key keeping the old one in
+  `OH_PREVIOUS_SECRET_KEYS`, read and re-save it, then restart without the
+  old key.
+  ```sh
+  control-agent-server api POST /api/profiles/qa-previous --json '{"llm": {"model": "openai/qa-previous", "api_key": "sk-qa-f20-previous"}}' --expect 201
+  control-agent-server restart --rotate-secret-key --keep-previous-secret-key
+  control-agent-server api GET /api/profiles/qa-previous --header 'X-Expose-Secrets: plaintext' --expect 200 --check config.api_key eq sk-qa-f20-previous --check api_key_set eq true --save F20.secret-key-previous-keys/detail-under-new-key
+  control-agent-server api POST /api/profiles/qa-previous --json '{"llm": {"model": "openai/qa-previous", "api_key": "sk-qa-f20-previous"}}' --expect 2xx --save F20.secret-key-previous-keys/resave
+  control-agent-server restart
+  control-agent-server api GET /api/profiles/qa-previous --header 'X-Expose-Secrets: plaintext' --expect 200 --check config.api_key eq sk-qa-f20-previous --save F20.secret-key-previous-keys/detail-without-old-key
+  control-agent-server api GET /api/settings --max-chars 200 --check active_profile eq deepseek-flash --check llm_api_key_is_set eq true
+  control-agent-server api DELETE /api/profiles/qa-previous --expect 200
+  ```
+  With the old key listed, the profile saved under it reads its key under
+  the new one (decryption tries the new key, then each previous key), and a
+  save writes it under the new key, so after the plain `restart`, which drops
+  the old key, it still reads. The settings' LLM key was re-encrypted at
+  startup, so it is still set. Profiles are re-encrypted only when saved: a
+  profile never re-saved, such as `deepseek-flash` here, needs the old key
+  listed; without it, it takes the lost-key path below. Run just before
+  `F20.secret-key-rotation`.
+- **Secret key lost (`F20.secret-key-rotation`).** Save a
+  profile, restart with a new secret key without keeping the old one, then
+  activate and re-save it.
   ```sh
   control-agent-server api POST /api/profiles/qa-rotate --json '{"llm": {"model": "openai/qa-rotate", "api_key": "sk-qa-f20-rotate"}}' --expect 201
   control-agent-server api GET /api/profiles/qa-rotate --header 'X-Expose-Secrets: plaintext' --expect 200 --check config.api_key eq sk-qa-f20-rotate
@@ -922,8 +946,8 @@ Preconditions:
   control-agent-server state cat home/.openhands/profiles/qa-rotate.json --check api_key matches '^gAAAAA'
   control-agent-server api GET /api/profiles/qa-rotate --header 'X-Expose-Secrets: plaintext' --expect 2xx,4xx --save F20.secret-key-rotation/detail
   control-agent-server api GET /api/profiles --expect 2xx,4xx --save F20.secret-key-rotation/list
-  control-agent-server api POST /api/profiles/qa-rotate/activate --expect 409 --check detail eq "Profile 'qa-rotate' is encrypted with a different key" --save F20.secret-key-rotation/activate
-  control-agent-server api POST /api/profiles/qa-rotate --json '{"llm": {"model": "openai/qa-rotate"}}' --expect 409 --check detail eq "Profile 'qa-rotate' is encrypted with a different key" --save F20.secret-key-rotation/resave
+  control-agent-server api POST /api/profiles/qa-rotate/activate --expect 409 --check detail contains "Profile 'qa-rotate' is encrypted with a different key" --save F20.secret-key-rotation/activate
+  control-agent-server api POST /api/profiles/qa-rotate --json '{"llm": {"model": "openai/qa-rotate"}}' --expect 409 --check detail contains "Profile 'qa-rotate' is encrypted with a different key" --save F20.secret-key-rotation/resave
   control-agent-server state cat home/.openhands/profiles/qa-rotate.json --check api_key matches '^gAAAAA'
   control-agent-server api GET /api/settings --max-chars 200 --check active_profile eq deepseek-flash
   control-agent-server state cat home/.openhands/settings.json --max-chars 200 --check agent_settings.llm.api_key matches '^gAAAAA'
@@ -933,7 +957,8 @@ Preconditions:
   the profile file still holds the old token, `GET` by name says
   `api_key_set: false` with a `null` key (reads stay lenient), and the list
   still says `api_key_set: true` (see Gotchas). Activation is refused with
-  409 `Profile 'qa-rotate' is encrypted with a different key` before
+  409 `Profile 'qa-rotate' is encrypted with a different key` (the detail
+  goes on to say to restore the key or add it to `OH_PREVIOUS_SECRET_KEYS`) before
   anything is written, instead of applying an LLM with `api_key: null` over
   the settings' stored key, so `deepseek-flash` stays active and the
   settings keep their old ciphertext. Saving the keyless config read back

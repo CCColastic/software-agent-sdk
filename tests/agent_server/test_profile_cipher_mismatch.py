@@ -7,6 +7,7 @@ a keyless LLM to settings, and re-saving it wrote ``null`` over the stored key.
 import json
 import os
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -43,11 +44,13 @@ def dirs():
             os.environ.pop("OH_PERSISTENCE_DIR", None)
 
 
-@pytest.fixture
-def client_b(dirs: Path):
-    """A server running under KEY_B."""
+@contextmanager
+def _client(dirs: Path, previous_keys: tuple[str, ...] = ()):
     config = Config(
-        static_files_path=None, session_api_keys=[], secret_key=SecretStr(KEY_B)
+        static_files_path=None,
+        session_api_keys=[],
+        secret_key=SecretStr(KEY_B),
+        previous_secret_keys=[SecretStr(k) for k in previous_keys],
     )
     with (
         patch(
@@ -64,6 +67,13 @@ def client_b(dirs: Path):
         ),
     ):
         yield TestClient(create_app(config))
+
+
+@pytest.fixture
+def client_b(dirs: Path):
+    """A server running under KEY_B."""
+    with _client(dirs) as client:
+        yield client
 
 
 def _seed_profile_under_key_a(dirs: Path) -> bytes:
@@ -90,9 +100,10 @@ def test_activate_undecryptable_profile_refused(client_b: TestClient, dirs: Path
     response = client_b.post(f"/api/profiles/{PROFILE}/activate")
 
     assert response.status_code == 409
-    assert response.json()["detail"] == (
+    assert response.json()["detail"].startswith(
         f"Profile '{PROFILE}' is encrypted with a different key"
     )
+    assert "OH_PREVIOUS_SECRET_KEYS" in response.json()["detail"]
     assert "gAAAAA" not in response.text
     # Nothing was written: no keyless LLM applied, profile file untouched.
     assert not settings_path.exists()
@@ -107,9 +118,10 @@ def test_patch_active_undecryptable_profile_refused(client_b: TestClient, dirs: 
     response = client_b.patch("/api/settings", json={"active_profile": PROFILE})
 
     assert response.status_code == 409
-    assert response.json()["detail"] == (
+    assert response.json()["detail"].startswith(
         f"Profile '{PROFILE}' is encrypted with a different key"
     )
+    assert "OH_PREVIOUS_SECRET_KEYS" in response.json()["detail"]
     assert not (dirs / "settings" / "settings.json").exists()
 
 
@@ -129,9 +141,10 @@ def test_resave_undecryptable_profile_refused(client_b: TestClient, dirs: Path):
     response = client_b.post(f"/api/profiles/{PROFILE}", json={"llm": config})
 
     assert response.status_code == 409
-    assert response.json()["detail"] == (
+    assert response.json()["detail"].startswith(
         f"Profile '{PROFILE}' is encrypted with a different key"
     )
+    assert "OH_PREVIOUS_SECRET_KEYS" in response.json()["detail"]
     assert (dirs / "profiles" / f"{PROFILE}.json").read_bytes() == before
     assert _profile_key_under_key_a(dirs) == "sk-a"
 
@@ -144,3 +157,40 @@ def test_resave_undecryptable_profile_refused(client_b: TestClient, dirs: Path):
     assert saved.status_code == 201
     stored = json.loads((dirs / "profiles" / f"{PROFILE}.json").read_text())
     assert Cipher(KEY_B).try_decrypt_str(stored["api_key"]) == "sk-b"
+
+
+def test_previous_key_lets_a_profile_activate_and_resave(dirs: Path):
+    """With KEY_A in previous_secret_keys a rotation keeps the profile usable,
+    and re-saving it moves the stored key to KEY_B."""
+    _seed_profile_under_key_a(dirs)
+
+    with _client(dirs, previous_keys=(KEY_A,)) as client:
+        detail = client.get(
+            f"/api/profiles/{PROFILE}", headers={"X-Expose-Secrets": "plaintext"}
+        )
+        assert detail.status_code == 200
+        assert detail.json()["config"]["api_key"] == "sk-a"
+
+        assert client.post(f"/api/profiles/{PROFILE}/activate").status_code == 200
+        settings = client.get(
+            "/api/settings", headers={"X-Expose-Secrets": "plaintext"}
+        ).json()
+        assert settings["agent_settings"]["llm"]["api_key"] == "sk-a"
+
+        resaved = client.post(
+            f"/api/profiles/{PROFILE}",
+            json={"llm": detail.json()["config"]},
+        )
+        assert resaved.status_code == 201
+
+    stored = json.loads((dirs / "profiles" / f"{PROFILE}.json").read_text())
+    assert Cipher(KEY_B).try_decrypt_str(stored["api_key"]) == "sk-a"
+    reset_stores()
+
+    # The previous key is no longer needed for the profile or the settings.
+    with _client(dirs) as client:
+        assert client.post(f"/api/profiles/{PROFILE}/activate").status_code == 200
+        settings = client.get(
+            "/api/settings", headers={"X-Expose-Secrets": "plaintext"}
+        ).json()
+        assert settings["agent_settings"]["llm"]["api_key"] == "sk-a"

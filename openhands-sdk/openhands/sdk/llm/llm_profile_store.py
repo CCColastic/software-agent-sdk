@@ -78,8 +78,9 @@ def _raise_if_undecryptable(profile_path: Path, cipher: Cipher) -> None:
         ):
             raise SecretDecryptionError(
                 f"Profile `{profile_path.stem}` holds a secret that cannot be "
-                "decrypted with the current cipher. Verify that OH_SECRET_KEY "
-                "matches the key used to save it, or delete the profile."
+                "decrypted with any configured key. Restore the key it was "
+                "saved under as OH_SECRET_KEY, add it to OH_PREVIOUS_SECRET_KEYS, "
+                "or delete the profile."
             )
 
 
