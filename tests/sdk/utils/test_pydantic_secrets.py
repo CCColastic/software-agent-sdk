@@ -535,3 +535,34 @@ def test_validate_secret_dict_strict_raises_on_wrong_cipher(mock_info, cipher):
         "API_TOKEN": "env-value",
         "PLAIN": "kept",
     }
+
+
+def test_strict_decrypt_accepts_a_previous_key(mock_info):
+    token = Cipher("old-key").encrypt(SecretStr("sk-test-123"))
+    rotated = Cipher("new-key", previous_keys=["old-key"])
+    strict = mock_info({"cipher": rotated, STRICT_DECRYPT_CONTEXT_KEY: True})
+
+    result = validate_secret(token, strict)
+    assert result is not None
+    assert result.get_secret_value() == "sk-test-123"
+    assert validate_secret_dict({"T": token}, strict) == {"T": "sk-test-123"}
+
+
+def test_strict_decrypt_error_names_previous_keys(mock_info):
+    token = Cipher("old-key").encrypt(SecretStr("sk-test-123"))
+    strict = mock_info({"cipher": Cipher("new-key"), STRICT_DECRYPT_CONTEXT_KEY: True})
+    with pytest.raises(SecretDecryptionError, match="OH_PREVIOUS_SECRET_KEYS"):
+        validate_secret(token, strict)
+
+
+def test_serialize_secret_rotates_a_token_under_a_previous_key(mock_info):
+    old_token = Cipher("old-key").encrypt(SecretStr("sk-test-123"))
+    assert old_token is not None
+    rotated = Cipher("new-key", previous_keys=["old-key"])
+
+    out = serialize_secret(SecretStr(old_token), mock_info({"cipher": rotated}))
+    assert isinstance(out, str)
+    assert out != old_token
+    assert Cipher("new-key").try_decrypt_str(out) == "sk-test-123"
+    # A token already under the current key is kept as is.
+    assert serialize_secret(SecretStr(out), mock_info({"cipher": rotated})) == out
