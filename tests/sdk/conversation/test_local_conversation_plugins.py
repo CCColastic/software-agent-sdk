@@ -1815,6 +1815,32 @@ class TestAmbientPluginResume:
         assert {"exp-skill", "exp:hello"} <= skills
         assert "exp-server" in servers
 
+    def test_failed_discovery_keeps_ambient_contributions_on_resume(
+        self, tmp_path: Path, mock_llm, monkeypatch
+    ):
+        """A transient discovery failure keeps the last load's contributions and
+        their record, so the next successful load still reconciles them."""
+        install_store, _, workspace = self._setup(tmp_path, monkeypatch)
+        source = self._make_plugin(tmp_path / "src", "amb")
+        install_plugin(str(source), installed_dir=install_store)
+        cid = uuid.uuid4()
+        plugin_skills = {"amb-skill", "amb:hello"}
+        self._load(tmp_path, workspace, cid, agent=self._caller_agent(mock_llm))
+
+        with patch(
+            "openhands.sdk.conversation.impl.local_conversation.load_available_plugins",
+            side_effect=OSError("transient"),
+        ):
+            skills, servers = self._load(tmp_path, workspace, cid)
+        assert plugin_skills | {"caller-skill"} <= skills
+        assert {"amb-server", "caller-server"} <= servers
+
+        disable_plugin("amb", installed_dir=install_store)
+        skills, servers = self._load(tmp_path, workspace, cid)
+        assert not plugin_skills & skills
+        assert "amb-server" not in servers
+        assert "caller-skill" in skills
+
     def test_legacy_state_drops_disabled_installed_plugin_on_resume(
         self, tmp_path: Path, mock_llm, monkeypatch
     ):

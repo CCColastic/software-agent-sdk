@@ -996,10 +996,32 @@ class LocalConversation(BaseConversation):
         merged_context = self.agent.agent_context
         merged_mcp = dict(self.agent.mcp_config) if self.agent.mcp_config else {}
 
+        # Discover ambient plugins up front (they are merged further below).
+        # ``None`` means discovery failed: then the previous contributions are
+        # kept and their record is left as is, so a transient failure does not
+        # strip a still-enabled plugin from the resumed conversation.
+        try:
+            ambient_plugins: dict[str, Plugin] | None = load_available_plugins(
+                work_dir=self.workspace.working_dir,
+                include_user=True,
+                include_project=True,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to load ambient (installed/local) plugins; "
+                "continuing without them",
+                exc_info=True,
+            )
+            ambient_plugins = None
+
         # Drop what ambient plugins contributed at the last load: ambient
-        # discovery below only adds, so without this a plugin disabled or
-        # removed since then would keep its skills and MCP servers on resume.
-        stale_skills, stale_servers = self._previous_ambient_contributions()
+        # discovery only adds, so without this a plugin disabled or removed
+        # since then would keep its skills and MCP servers on resume.
+        stale_skills, stale_servers = (
+            self._previous_ambient_contributions()
+            if ambient_plugins is not None
+            else (set(), set())
+        )
         ambient_contributions_dropped = False
         if merged_context is not None and stale_skills:
             kept = [s for s in merged_context.skills if s.name not in stale_skills]
@@ -1143,21 +1165,7 @@ class LocalConversation(BaseConversation):
         # like project skills. Automation/sandbox runs lack the user's installed
         # and home directories, so discovery naturally yields nothing there.
         ambient_plugins_loaded = False
-        try:
-            ambient_plugins = load_available_plugins(
-                work_dir=self.workspace.working_dir,
-                include_user=True,
-                include_project=True,
-            )
-        except Exception:
-            logger.warning(
-                "Failed to load ambient (installed/local) plugins; "
-                "continuing without them",
-                exc_info=True,
-            )
-            ambient_plugins = {}
-
-        for plugin in ambient_plugins.values():
+        for plugin in (ambient_plugins or {}).values():
             if plugin.name in explicit_plugin_names:
                 logger.debug(
                     f"Skipping ambient plugin '{plugin.name}' "
@@ -1277,7 +1285,7 @@ class LocalConversation(BaseConversation):
         # Record this load's ambient contributions for the next resume.
         recorded_skills = sorted(ambient_skill_names)
         recorded_servers = sorted(ambient_server_names)
-        if (
+        if ambient_plugins is not None and (
             self._state.ambient_plugin_skills != recorded_skills
             or self._state.ambient_plugin_mcp_servers != recorded_servers
         ):
