@@ -3,6 +3,7 @@
 import asyncio
 import signal
 from unittest.mock import AsyncMock, MagicMock, call, patch
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -287,6 +288,37 @@ def test_get_vscode_url_with_token(vscode_service):
     assert custom_url == "http://example.com:9000/?tkn=test-token-123&folder=workspace"
 
 
+@pytest.mark.parametrize(
+    "workspace_dir",
+    ["/tmp/qa f16&x=1#frag", "/w/a?b=c", "/w/100% +plus", "/workspace"],
+)
+def test_get_vscode_url_folder_round_trips(vscode_service, workspace_dir):
+    """The folder parameter decodes back to the exact workspace path."""
+    vscode_service.connection_token = "test-token-123"
+
+    url = vscode_service.get_vscode_url(workspace_dir=workspace_dir)
+
+    assert url is not None
+    parts = urlsplit(url)
+    assert parts.fragment == ""
+    assert parse_qs(parts.query) == {
+        "tkn": ["test-token-123"],
+        "folder": [workspace_dir],
+    }
+
+
+def test_get_vscode_url_keeps_slashes_readable(vscode_service):
+    """Path separators in the folder parameter are not percent-encoded."""
+    vscode_service.connection_token = "test-token-123"
+
+    url = vscode_service.get_vscode_url(workspace_dir="/tmp/qa f16&x=1#frag")
+
+    assert url == (
+        f"http://localhost:{vscode_service.port}/"
+        "?tkn=test-token-123&folder=/tmp/qa%20f16%26x%3D1%23frag"
+    )
+
+
 def test_get_vscode_url_with_custom_port():
     """Test getting VSCode URL with custom port."""
     service = VSCodeService(port=9001)
@@ -322,16 +354,16 @@ def test_get_vscode_url_base_path_with_caller_supplied_base_url():
     service = VSCodeService(port=19000, server_base_path="vscode")
     service.connection_token = "test-token-789"
 
-    expected = "https://example.com/vscode/?tkn=test-token-789&folder=%2Fsrv%2Fwork"
+    expected = "https://example.com/vscode/?tkn=test-token-789&folder=/srv/work"
     assert (
         service.get_vscode_url(
-            base_url="https://example.com", workspace_dir="%2Fsrv%2Fwork"
+            base_url="https://example.com", workspace_dir="/srv/work"
         )
         == expected
     )
     assert (
         service.get_vscode_url(
-            base_url="https://example.com/", workspace_dir="%2Fsrv%2Fwork"
+            base_url="https://example.com/", workspace_dir="/srv/work"
         )
         == expected
     )

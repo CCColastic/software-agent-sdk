@@ -49,7 +49,7 @@ Routes: `GET /api/conversations/{conversation_id}/workspace`,
 - `F16.vscode-url-not-running`: a VS Code that is not running must not be advertised: `url` is null while `running` is false (known bug: a keyed server returns a URL carrying the session key).
 - `F16.vscode-url-no-key`: a server without session keys, with VS Code enabled but not running (no binary), answers `{"url": null}` on both URL routes.
 - `F16.vscode-url-after-init`: a deferred-init server that receives its session key through `POST /api/init`, with VS Code enabled but not running (no binary), answers `{"url": null}`.
-- `F16.vscode-folder-encoding`: the URL's `folder` parameter decodes back to the workspace path even when the path contains `&` or `#` (known bug: the value is not URL-encoded).
+- `F16.vscode-folder-encoding`: the URL's `folder` parameter decodes back to the workspace path even when the path contains `&` or `#`.
 - `F16.docker-root-cookie`: in Docker runtime mode the slashless workspace root accepts the workspace cookie like the slashed form does (known bug: it falls into the header-only proxy and answers 401).
 - `F16.vscode-running`: with the OpenVSCode Server binary installed and its port free, status reports `running: true` and the URL opens the editor (blocked on this machine: no binary).
 
@@ -430,9 +430,11 @@ Preconditions:
   `get_vscode_service()` seeds the token from `session_api_keys[0]` before
   `start()` fails. Consumers that show an "open VS Code" link get a dead one.
   Low severity: the URL only reaches callers that already hold the key.
-- **Folder with `&` and `#` (`F16.vscode-folder-encoding`), known bug.**
+- **Folder with `&` and `#` (`F16.vscode-folder-encoding`).**
   Parse the scoped URL as a browser would, first for the normal workspace,
   then for a workspace named `qa f16&x=1#frag`.
+
+  Requires: `F16.vscode-enabled-status`
   ```sh
   ROUNDTRIP='import sys, urllib.parse as u; p = u.urlsplit(sys.stdin.read().strip()); q = u.parse_qs(p.query); sys.exit(0 if q.get("folder") == [sys.argv[1]] and not p.fragment else 1)'
   control-agent-server api GET "/api/conversations/$CID/vscode/url" --expect 200 --field url | python3 -c "$ROUNDTRIP" "$WS"
@@ -442,12 +444,12 @@ Preconditions:
   control-agent-server api GET "/api/conversations/$ODD/vscode/url" --expect 200 --save F16.vscode-folder-encoding/odd-folder
   control-agent-server api GET "/api/conversations/$ODD/vscode/url" --expect 200 --field url \
     | python3 -c 'import sys, json, urllib.parse as u; p = u.urlsplit(sys.stdin.read().strip()); print(json.dumps({"folder": u.parse_qs(p.query).get("folder"), "fragment": p.fragment}))' \
-    | control-agent-server assert --check folder len-eq 1 --check folder.0 eq "$OWS" --check fragment eq ''  # bug: value.fragment eq frag && value.folder.0 matches '/qa f16$'
+    | control-agent-server assert --check folder len-eq 1 --check folder.0 eq "$OWS" --check fragment eq ''
   ```
   The normal workspace round-trips. For the odd one the `folder` parameter
-  should decode back to `.../qa f16&x=1#frag`; today the value is pasted
-  unencoded, so a parser reads `folder=.../qa f16`, an extra `x=1` parameter
-  and a `#frag` fragment, and VS Code would open the wrong folder. Without
+  decodes back to `.../qa f16&x=1#frag` with no fragment: the query values
+  are percent-encoded (`/` stays as is), so a parser does not read
+  `folder=.../qa f16`, an extra `x=1` parameter and a `#frag` fragment. Without
   the OpenVSCode binary the URL is only readable through the defect of
   `F16.vscode-url-not-running` (see Gotchas).
 - **No key, no URL (`F16.vscode-url-no-key`).** A second server without
@@ -550,8 +552,8 @@ Preconditions:
   Code is not running (see `F16.vscode-url-not-running`). When that bug is
   fixed, the shape and the folder encoding are only observable with the
   binary installed; move those checks into `F16.vscode-running` at the same
-  time (until then `vscode-url-shape` fails and `vscode-folder-encoding`
-  fails before its `# bug` line, which is the signal to move them).
+  time (until then `vscode-url-shape` and `vscode-folder-encoding` fail,
+  which is the signal to move them).
 - A null URL is asserted on the whole body (`--check . eq '{"url": null}'`):
   `--check url missing` and `--check url eq null` also pass when the key is
   absent, which would break the SDK and TypeScript models that expect it.
