@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -650,6 +651,64 @@ def test_duplicate_usage_ids_in_registration_loop_are_silently_deduped(tmp_path)
 
     # First-write-wins: only one entry under the shared usage_id
     assert conv.llm_registry.list_usage_ids().count("default") == 1
+
+
+def _persisted_usage_id(conv: LocalConversation) -> str:
+    return json.loads(conv.state._fs.read(BASE_STATE))["agent"]["llm"]["usage_id"]
+
+
+def test_switch_llm_inside_held_state_lock_persists_at_once(tmp_path):
+    """A switch made while the caller already holds the state lock (the
+    agent-server route on the event-loop thread while ``arun()`` holds it for
+    the running step) is in ``base_state.json`` before the lock is released,
+    not only when the enclosing block exits at the end of the step.
+    """
+    conv = LocalConversation(
+        agent=Agent(llm=_make_llm("default-model", "default"), tools=[]),
+        workspace=tmp_path,
+        persistence_dir=str(tmp_path / "persist"),
+        visualizer=None,
+    )
+    assert _persisted_usage_id(conv) == "default"
+
+    with conv.state:  # the running step's lock, re-entered by the switch
+        conv.switch_llm(_make_llm("inline-model", "switched"))
+        assert _persisted_usage_id(conv) == "switched"
+        conv.switch_llm(_make_llm("other-model", "switched-again"))
+        assert _persisted_usage_id(conv) == "switched-again"
+
+
+def test_switch_llm_from_tool_thread_during_step_persists_at_once(tmp_path):
+    """A ``switch_llm`` tool runs on a worker thread while the run loop holds
+    the state lock on another thread (``skip_lock`` path, #3485); the switch is
+    persisted at once instead of at the end of the step.
+    """
+    conv = LocalConversation(
+        agent=Agent(llm=_make_llm("default-model", "default"), tools=[]),
+        workspace=tmp_path,
+        persistence_dir=str(tmp_path / "persist"),
+        visualizer=None,
+    )
+    step_holds_lock = threading.Event()
+    release_step = threading.Event()
+
+    def run_loop_step() -> None:
+        with conv.state:
+            step_holds_lock.set()
+            release_step.wait(timeout=10)
+
+    step = threading.Thread(target=run_loop_step)
+    step.start()
+    try:
+        assert step_holds_lock.wait(timeout=10)
+        conv._step_holds_state_lock = True
+        conv.switch_llm(_make_llm("inline-model", "switched"))
+        assert _persisted_usage_id(conv) == "switched"
+    finally:
+        conv._step_holds_state_lock = False
+        release_step.set()
+        step.join(timeout=10)
+    assert _persisted_usage_id(conv) == "switched"
 
 
 def test_switch_llm_tool_during_arun_does_not_deadlock(profile_store, tmp_path):

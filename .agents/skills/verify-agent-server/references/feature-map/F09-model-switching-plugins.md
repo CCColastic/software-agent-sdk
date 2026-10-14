@@ -364,7 +364,7 @@ Preconditions:
   the run finishes. Both `usage_id`s have tokens: the call that chose
   `sleep 20` ran on `default`, the call after its observation on
   `qa-f09-midrun`, so the switch applied inside the same run.
-- **GET right after a mid-run switch (`F09.switch-llm-mid-run-get`), known bug.**
+- **GET right after a mid-run switch (`F09.switch-llm-mid-run-get`).**
   The same situation, read back at once.
   ```sh
   GID=$(control-agent-server conversation start --tools terminal --no-autotitle --prompt 'Run this exact shell command and nothing else: sleep 20' --print-id)
@@ -376,28 +376,21 @@ Preconditions:
     --expect 200 --save F09.switch-llm-mid-run-get/switch
   control-agent-server ws read qa-f09-midget --kinds ConversationStateUpdateEvent --contains '"usage_id": "qa-f09-midget"' --expect-min 1 --wait 10 --save F09.switch-llm-mid-run-get/frames
   control-agent-server api GET "/api/conversations/$GID" --quiet --check execution_status eq running
-  control-agent-server api GET "/api/conversations/$GID" --quiet --check agent.llm.usage_id eq qa-f09-midget --save F09.switch-llm-mid-run-get/get  # bug: status eq 200 && checks.0.actual eq default
-  control-agent-server state cat "server/workspace/conversations/${GID//-/}/base_state.json" --max-chars 200 --check agent.llm.usage_id eq qa-f09-midget  # bug: checks.0.actual eq default
+  control-agent-server api GET "/api/conversations/$GID" --quiet --check agent.llm.usage_id eq qa-f09-midget --save F09.switch-llm-mid-run-get/get
+  control-agent-server state cat "server/workspace/conversations/${GID//-/}/base_state.json" --max-chars 200 --check agent.llm.usage_id eq qa-f09-midget
   control-agent-server conversation wait "$GID" --until finished,error --timeout 240
   control-agent-server api GET "/api/conversations/$GID" --quiet --check execution_status eq finished --check agent.llm.usage_id eq qa-f09-midget
   ```
   The switch is 200 while `sleep 20` runs, and the socket pushes the
-  switched `agent` (`usage_id` `qa-f09-midget`) at once. Expected: `GET`
-  shows `qa-f09-midget` from then on. Today the next `GET` (and
-  `base_state.json`, which it serves) still report `default` with the run
-  `running`, and keep it until the running step ends, about 20 s later,
-  although the in-memory agent already switched. (The first `GET` is the
-  control that the reads land inside the step; the marked `GET` is the
-  assertion that should hold. On a failure the `EXIT` trap waits for the run
-  and stops the capture.) The route
-  calls `LocalConversation.switch_llm` on the event-loop thread; `arun()`
-  holds the reentrant state lock on that same thread during the step, so the
-  switch re-enters it and its autosave is deferred to the step's exit (the
-  `arun()` comment says unrelated mutators must go through
-  `run_in_executor`; `load_plugin` and `switch_acp_model` do). A consumer
-  that verifies the switch with `GET` sees the old model for as long as the
-  tool runs, and a `restart --hard` in that window loses the acknowledged
-  switch (seen live: `GET` shows `default` after the restart).
+  switched `agent` (`usage_id` `qa-f09-midget`) at once. The next `GET`
+  (and `base_state.json`, which it serves) already report `qa-f09-midget`
+  while the run is still `running`: `switch_llm` writes `base_state.json`
+  before it returns, although the running step holds the state lock (the
+  route re-enters it on the event-loop thread) and would otherwise defer the
+  write to the step's end. So a `restart --hard` right after the 200 keeps
+  the switch. (The first `GET` is the control that the reads land inside the
+  step. On a failure the `EXIT` trap waits for the run and stops the
+  capture.)
 - **ACP switch on a regular conversation (`F09.acp-model-native`).** `CID`
   runs an OpenHands `Agent`.
   ```sh
@@ -765,11 +758,9 @@ Preconditions:
 
 - Every switch answers `{"success": true}` and nothing else; read the result
   back with `GET /api/conversations/{id}` (which serves the autosaved
-  `base_state.json`, so on an idle conversation it shows a switch
-  immediately) or the `ConversationStateUpdateEvent` with key `agent`.
-  While a step is running, `GET` keeps the old LLM until the step ends
-  (`F09.switch-llm-mid-run-get`); the socket and the run itself switch at
-  once, so wait for the run (or read the socket) before asserting on `GET`.
+  `base_state.json`; it shows a switch immediately, also while a step is
+  running, `F09.switch-llm-mid-run-get`) or the
+  `ConversationStateUpdateEvent` with key `agent`.
 - The LLM registry of a conversation is first-write-wins per `usage_id`:
   `switch_llm` with a `usage_id` that is already registered (the default
   `default` once the agent initialized, or any id used before) silently

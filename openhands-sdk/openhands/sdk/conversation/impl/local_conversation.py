@@ -1686,6 +1686,11 @@ class LocalConversation(BaseConversation):
             )
             self.agent = self.agent.model_copy(update=update)
             self._state.agent = self.agent
+            # Persist before returning: mid-step, the run loop's enclosing
+            # ``with self._state:`` would defer the write to the step's end, so
+            # GET (which reads base_state.json) and a hard restart would miss
+            # an acknowledged switch for as long as the step runs.
+            self._state._flush_deferred_save()
             # Invalidate the cached ask-agent LLM so it re-clones.
             self.llm_registry.remove(ASK_AGENT_LLM_USAGE_ID)
 

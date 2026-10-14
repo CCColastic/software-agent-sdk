@@ -763,6 +763,19 @@ class ConversationState(OpenHandsModel):
         finally:
             self._lock.release()
 
+    def _flush_deferred_save(self) -> None:
+        """Write a deferred base-state save now, inside an enclosing block.
+
+        For a change that must be durable as soon as the call that made it
+        returns, even when an outer ``with state:`` block (the running step)
+        would otherwise defer the write to its exit. The snapshot is the whole
+        state, so the outer block has nothing left to flush for it.
+        """
+        # _autosave_enabled is only set once _fs is assigned.
+        if self._dirty and self._autosave_enabled:
+            self._save_base_state(self._fs)
+            self._dirty = False
+
     def locked(self) -> bool:
         """
         Return True if the lock is currently held by any thread.
