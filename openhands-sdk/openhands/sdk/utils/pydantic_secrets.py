@@ -1,6 +1,6 @@
 import logging
 from collections.abc import Mapping
-from typing import Any, Literal, overload
+from typing import Any, Final, Literal, overload
 
 from pydantic import SecretStr, ValidationInfo
 
@@ -25,11 +25,11 @@ class MissingCipherError(ValueError):
 # ``SecretDecryptionError`` for a Fernet token the cipher cannot decrypt,
 # instead of returning ``None``. Read-modify-write paths set it so a write
 # under a changed key cannot persist ``null`` over the stored ciphertext.
-STRICT_DECRYPT_CONTEXT_KEY = "strict_decrypt"
+STRICT_DECRYPT_CONTEXT_KEY: Final[str] = "strict_decrypt"
 
 
 # Operator guidance for a stored value no configured key can decrypt.
-UNDECRYPTABLE_SECRET_HINT = (
+UNDECRYPTABLE_SECRET_HINT: Final[str] = (
     "It was saved under a key that is neither OH_SECRET_KEY nor in "
     "OH_PREVIOUS_SECRET_KEYS: restore that key as OH_SECRET_KEY, or add it to "
     "OH_PREVIOUS_SECRET_KEYS to rotate to the current key."

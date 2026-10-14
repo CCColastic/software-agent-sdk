@@ -643,7 +643,7 @@ Preconditions:
   control-agent-server api GET /api/settings --expect 200 --check llm_api_key_is_set eq false \
     --check agent_settings.llm.model eq "$DEFAULT_MODEL" --save F18.corrupted-files/get-settings
   control-agent-server api PATCH /api/settings --json '{"misc_settings_diff": {"qa_f18_probe": 1}}' --expect 409 \
-    --check detail eq 'Settings file is corrupted or encrypted with a different key' --save F18.corrupted-files/patch
+    --check detail contains 'Settings file is corrupted or encrypted with a different key' --save F18.corrupted-files/patch
   control-agent-server state cat home/.openhands/settings.json --contains qa-f18-corrupt
   control-agent-server api GET /api/settings/secrets --expect 200 --check secrets len-eq 0 --save F18.corrupted-files/list-secrets
   control-agent-server api GET /api/settings/secrets/QA_F18_TOKEN --expect 404
