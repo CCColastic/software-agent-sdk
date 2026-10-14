@@ -88,6 +88,23 @@ class InstallationManager[T: ExtensionProtocol]:
             FileExistsError: If extension is already installed and force=False.
             ValueError: If the extension name is invalid.
         """
+        return self._install(source, ref=ref, repo_path=repo_path, force=force)
+
+    def _install(
+        self,
+        source: str | Path,
+        ref: str | None = None,
+        repo_path: str | None = None,
+        force: bool = False,
+        root_name: str | None = None,
+    ) -> InstallationInfo:
+        """Install as ``install`` does; ``root_name`` names a repository root.
+
+        ``root_name`` replaces the repository's name as the directory name a
+        remote source without ``repo_path`` is loaded from (see
+        ``_load_fetched``).  ``update`` passes the installed name, so an
+        extension installed under another name keeps it.
+        """
         if isinstance(source, Path):
             source = str(source)
 
@@ -100,7 +117,7 @@ class InstallationManager[T: ExtensionProtocol]:
             update=True,
         )
 
-        extension = self._load_fetched(fetched_path, source, repo_path)
+        extension = self._load_fetched(fetched_path, source, repo_path, root_name)
         validate_extension_name(extension.name)
 
         install_path = self.installation_dir / extension.name
@@ -139,7 +156,11 @@ class InstallationManager[T: ExtensionProtocol]:
         return info
 
     def _load_fetched(
-        self, fetched_path: Path, source: str, repo_path: str | None
+        self,
+        fetched_path: Path,
+        source: str,
+        repo_path: str | None,
+        root_name: str | None = None,
     ) -> T:
         """Load the fetched extension, named after its repository if it is one.
 
@@ -153,7 +174,7 @@ class InstallationManager[T: ExtensionProtocol]:
             return self.installation_interface.load_from_dir(fetched_path)
 
         with tempfile.TemporaryDirectory() as staging:
-            load_path = Path(staging) / extract_repo_name(url)
+            load_path = Path(staging) / (root_name or extract_repo_name(url))
             shutil.copytree(
                 fetched_path,
                 load_path,
@@ -327,7 +348,8 @@ class InstallationManager[T: ExtensionProtocol]:
         Re-fetches the extension from its original source with ``ref=None``
         (i.e. the latest available) and force-reinstalls it.  The previous
         ``enabled`` state is preserved because ``install(force=True)``
-        carries it over.
+        carries it over.  A repository root without a manifest keeps its
+        installed name.
 
         Args:
             name: Name of the extension to update.
@@ -349,9 +371,10 @@ class InstallationManager[T: ExtensionProtocol]:
 
         redacted = redact_url_credentials(current_info.source)
         logger.info(f"Updating extension {name} from {redacted}")
-        return self.install(
+        return self._install(
             source=current_info.source,
             ref=None,
             repo_path=current_info.repo_path,
             force=True,
+            root_name=name,
         )

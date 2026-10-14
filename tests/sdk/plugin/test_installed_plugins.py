@@ -14,7 +14,6 @@ from pathlib import Path
 
 import pytest
 
-from openhands.sdk.extensions.fetch import get_cache_path, parse_extension_source
 from openhands.sdk.plugin import (
     Plugin,
     PluginFetchError,
@@ -28,7 +27,6 @@ from openhands.sdk.plugin import (
     uninstall_plugin,
     update_plugin,
 )
-from openhands.sdk.plugin.fetch import DEFAULT_CACHE_DIR as DEFAULT_PLUGIN_CACHE_DIR
 
 
 # ============================================================================
@@ -225,6 +223,37 @@ def test_install_git_repo_root_without_manifest_is_named_after_repo(
     assert [p.name for p in plugins] == ["qa-src"]
 
 
+def test_update_git_repo_root_keeps_installed_name(
+    tmp_path: Path, installed_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A repository root installed under another name (the cache directory
+    name, before the fix) keeps that name when it is updated."""
+    monkeypatch.setattr(
+        "openhands.sdk.extensions.installation.manager.DEFAULT_CACHE_DIR",
+        tmp_path / "cache",
+    )
+    repo = tmp_path / "src" / "qa-src"
+    repo.mkdir(parents=True)
+    (repo / "README.md").write_text("v1\n")
+    git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run([*git, "init", "-q"], check=True)
+    subprocess.run([*git, "add", "."], check=True)
+    subprocess.run([*git, "commit", "-qm", "init"], check=True)
+    install_plugin(source=f"file://{repo}", installed_dir=installed_dir)
+    legacy = installed_dir / "qa-src-0123456789abcdef"
+    (installed_dir / "qa-src").rename(legacy)
+    metadata = installed_dir / ".installed.json"
+    metadata.write_text(metadata.read_text().replace('"qa-src"', f'"{legacy.name}"'))
+
+    updated = update_plugin(legacy.name, installed_dir=installed_dir)
+
+    assert updated is not None
+    assert updated.name == legacy.name
+    assert [p.name for p in list_installed_plugins(installed_dir=installed_dir)] == [
+        legacy.name
+    ]
+
+
 # ============================================================================
 # Integration Tests (Real GitHub)
 # ============================================================================
@@ -287,8 +316,7 @@ def test_install_document_skills_plugin(installed_dir: Path) -> None:
             installed_dir=installed_dir,
         )
 
-        _, url = parse_extension_source(source)
-        expected_name = get_cache_path(url, DEFAULT_PLUGIN_CACHE_DIR).name
+        expected_name = "skills"
         assert info.name == expected_name
         assert info.source == source
 
