@@ -32,7 +32,7 @@ from openhands.sdk.llm.llm_profile_store import LLMProfileStore
 from openhands.sdk.llm.provider_connection_store import ProviderConnectionStore
 from openhands.sdk.logger import get_logger
 from openhands.sdk.profiles.agent_profile_store import AgentProfileStore
-from openhands.sdk.utils.cipher import Cipher
+from openhands.sdk.utils.cipher import FERNET_TOKEN_PREFIX, Cipher
 from openhands.sdk.utils.path import get_user_persistence_dir
 from openhands.sdk.utils.pydantic_secrets import (
     STRICT_DECRYPT_CONTEXT_KEY,
@@ -245,6 +245,34 @@ def _atomic_write_json(path: Path, data: dict) -> None:
 DEFAULT_PERSISTENCE_DIR = Path("workspace/.openhands")
 
 
+# Appended to the "different key" refusals of read-modify-write paths.
+_KEY_HINT = (
+    "restore the key it was saved under as OH_SECRET_KEY, or add it to "
+    "OH_PREVIOUS_SECRET_KEYS"
+)
+
+
+def _has_stale_token(cipher: Cipher, data: Any) -> bool:
+    """Whether ``data`` holds a Fernet token not under ``cipher``'s current key."""
+    if isinstance(data, str):
+        return data.startswith(FERNET_TOKEN_PREFIX) and not cipher.is_current(data)
+    if isinstance(data, dict):
+        return any(_has_stale_token(cipher, v) for v in data.values())
+    if isinstance(data, list):
+        return any(_has_stale_token(cipher, v) for v in data)
+    return False
+
+
+def _file_has_stale_token(path: Path, cipher: Cipher | None) -> bool:
+    if cipher is None or not cipher.previous_keys or not path.exists():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return _has_stale_token(cipher, data)
+
+
 def _load_context(cipher: Cipher | None, strict: bool) -> dict[str, Any] | None:
     """Validation context for loading a store file with ``cipher``."""
     if cipher is None:
@@ -431,13 +459,30 @@ class FileSettingsStore(SettingsStore):
                     # File exists but load() returned None - corrupted or unreadable
                     raise RuntimeError(
                         f"Cannot load settings from {self._path}. "
-                        "File may be corrupted or encrypted with a different key. "
+                        "File may be corrupted or encrypted with a different key "
+                        f"({_KEY_HINT}). "
                         "Refusing to overwrite with defaults to prevent data loss."
                     )
                 settings = PersistedSettings()
             updated = update_fn(settings)
             self.save(updated)
             return updated
+
+    def reencrypt(self) -> bool:
+        """Re-encrypt values saved under a previous key under the current key.
+
+        Returns ``True`` when the file was rewritten. The file is left as is
+        when nothing in it is stale, or when a value in it cannot be
+        decrypted with any configured key.
+        """
+        with _file_lock(self._lock_path):
+            if not _file_has_stale_token(self._path, self.cipher):
+                return False
+            settings = self.load(strict=True)
+            if settings is None:
+                return False
+            self.save(settings)
+            return True
 
 
 class FileSecretsStore(SecretsStore):
@@ -555,6 +600,22 @@ class FileSecretsStore(SecretsStore):
 
             self._save_with_versions(secrets, versions)
 
+    def reencrypt(self) -> bool:
+        """Re-encrypt values saved under a previous key under the current key.
+
+        Returns ``True`` when the file was rewritten. The file is left as is
+        when nothing in it is stale, or when a value in it cannot be
+        decrypted with any configured key.
+        """
+        with _file_lock(self._lock_path):
+            if not _file_has_stale_token(self._path, self.cipher):
+                return False
+            secrets = self.load(strict=True)
+            if secrets is None:
+                return False
+            self._save_with_versions(secrets, self._load_versions())
+            return True
+
     def _save_with_versions(
         self,
         secrets: Secrets,
@@ -627,7 +688,8 @@ class FileSecretsStore(SecretsStore):
                     # File exists but load() returned None - corrupted or unreadable
                     raise RuntimeError(
                         f"Cannot load secrets from {self._path}. "
-                        "File may be corrupted or encrypted with a different key. "
+                        "File may be corrupted or encrypted with a different key "
+                        f"({_KEY_HINT}). "
                         "Refusing to overwrite with defaults to prevent data loss."
                     )
                 secrets = Secrets()
@@ -661,7 +723,8 @@ class FileSecretsStore(SecretsStore):
                     # File exists but load() returned None - corrupted or unreadable
                     raise RuntimeError(
                         f"Cannot load secrets from {self._path}. "
-                        "File may be corrupted or encrypted with a different key. "
+                        "File may be corrupted or encrypted with a different key "
+                        f"({_KEY_HINT}). "
                         "Refusing to modify to prevent data loss."
                     )
                 return False
@@ -681,7 +744,8 @@ class FileSecretsStore(SecretsStore):
                 if self._path.exists():
                     raise RuntimeError(
                         f"Cannot load secrets from {self._path}. "
-                        "File may be corrupted or encrypted with a different key. "
+                        "File may be corrupted or encrypted with a different key "
+                        f"({_KEY_HINT}). "
                         "Refusing to modify to prevent data loss."
                     )
                 raise KeyError(name)
@@ -709,7 +773,8 @@ class FileSecretsStore(SecretsStore):
                 if self._path.exists():
                     raise RuntimeError(
                         f"Cannot load secrets from {self._path}. "
-                        "File may be corrupted or encrypted with a different key. "
+                        "File may be corrupted or encrypted with a different key "
+                        f"({_KEY_HINT}). "
                         "Refusing to modify to prevent data loss."
                     )
                 raise KeyError(name)
@@ -915,6 +980,27 @@ def get_secrets_store(config: Config | None = None) -> FileSecretsStore:
                 cipher=_get_cipher(config),
             )
         return _secrets_store
+
+
+def reencrypt_stale_stores(config: Config) -> None:
+    """Re-encrypt the settings and secrets stores under the current key.
+
+    Runs at startup when ``previous_secret_keys`` is configured, so a rotated
+    key does not wait for the next write. Failures are logged, never raised:
+    the stores stay readable through the previous keys either way.
+    """
+    cipher = config.cipher
+    if cipher is None or not cipher.previous_keys:
+        return
+    for name, store in (
+        ("settings", get_settings_store(config)),
+        ("secrets", get_secrets_store(config)),
+    ):
+        try:
+            if store.reencrypt():
+                logger.info(f"Re-encrypted the {name} store under the current key")
+        except Exception:
+            logger.error(f"Could not re-encrypt the {name} store", exc_info=True)
 
 
 def get_provider_connections_store(

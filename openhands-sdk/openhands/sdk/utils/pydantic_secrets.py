@@ -28,6 +28,14 @@ class MissingCipherError(ValueError):
 STRICT_DECRYPT_CONTEXT_KEY = "strict_decrypt"
 
 
+# Operator guidance for a stored value no configured key can decrypt.
+UNDECRYPTABLE_SECRET_HINT = (
+    "It was saved under a key that is neither OH_SECRET_KEY nor in "
+    "OH_PREVIOUS_SECRET_KEYS: restore that key as OH_SECRET_KEY, or add it to "
+    "OH_PREVIOUS_SECRET_KEYS to rotate to the current key."
+)
+
+
 class SecretDecryptionError(Exception):
     """A stored secret cannot be decrypted with the current cipher.
 
@@ -91,7 +99,9 @@ def serialize_secret(v: SecretStr | None, info):
             )
         raw = v.get_secret_value()
         if raw.startswith(FERNET_TOKEN_PREFIX) and cipher.try_decrypt_str(raw):
-            return raw
+            # Already a token: keep it, re-encrypted under the current key
+            # when only a previous key can read it.
+            return cipher.rotate(raw) or raw
         return cipher.encrypt(v)
 
     return v
@@ -136,8 +146,8 @@ def validate_secret(v: str | SecretStr | None, info) -> SecretStr | None:
         decrypted = cipher.decrypt(secret_value)
         if decrypted is None and info.context.get(STRICT_DECRYPT_CONTEXT_KEY):
             raise SecretDecryptionError(
-                "A stored secret cannot be decrypted with the current cipher. "
-                "Verify that OH_SECRET_KEY matches the key used to save it."
+                "A stored secret cannot be decrypted with any configured key. "
+                + UNDECRYPTABLE_SECRET_HINT
             )
         return decrypted
 
@@ -233,9 +243,8 @@ def validate_secret_dict(
                 and cipher.try_decrypt_str(v) is None
             ):
                 raise SecretDecryptionError(
-                    f"A stored {description} value cannot be decrypted with the "
-                    "current cipher. Verify that OH_SECRET_KEY matches the key "
-                    "used to save it."
+                    f"A stored {description} value cannot be decrypted with any "
+                    "configured key. " + UNDECRYPTABLE_SECRET_HINT
                 )
     return {
         k: decrypt_str_with_cipher_or_keep(cipher, v, description=description)

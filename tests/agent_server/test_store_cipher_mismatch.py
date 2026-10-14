@@ -18,6 +18,7 @@ from openhands.agent_server.persistence import (
     FileSecretsStore,
     FileSettingsStore,
     PersistedSettings,
+    reencrypt_stale_stores,
     reset_stores,
 )
 from openhands.agent_server.persistence.models import SettingsUpdatePayload
@@ -151,3 +152,153 @@ def test_api_writes_refuse_under_wrong_cipher(persistence_dir):
     assert (persistence_dir / "settings.json").read_bytes() == settings_before
     assert (persistence_dir / "secrets.json").read_bytes() == secrets_before
     _assert_original_key_reads_back(persistence_dir)
+
+
+# ── Key rotation: the old key listed in previous_secret_keys ─────────────
+
+KEY_C = "qa-cipher-key-c"
+
+
+def _rotated() -> Cipher:
+    return Cipher(KEY_B, previous_keys=[KEY_A])
+
+
+def _assert_readable_with(persistence_dir: Path, cipher: Cipher) -> None:
+    """Every stored value loads strictly (no ``None``) under ``cipher``."""
+    settings = FileSettingsStore(persistence_dir, cipher=cipher).load(strict=True)
+    assert settings is not None
+    llm = settings.agent_settings.llm
+    assert isinstance(llm, LLM)
+    assert isinstance(llm.api_key, SecretStr)
+    assert llm.api_key.get_secret_value() == LLM_KEY
+    secrets = FileSecretsStore(persistence_dir, cipher=cipher).load(strict=True)
+    assert secrets is not None
+    secret = secrets.custom_secrets["QA_TOKEN"].secret
+    assert secret is not None
+    assert secret.get_secret_value() == SECRET_VALUE
+
+
+def test_rotation_keeps_values_readable_and_reencrypts_on_save(persistence_dir):
+    _seed(persistence_dir)
+    cipher = _rotated()
+    settings_store = FileSettingsStore(persistence_dir, cipher=cipher)
+    secrets_store = FileSecretsStore(persistence_dir, cipher=cipher)
+
+    # Reads under the new key see the values saved under the old one.
+    _assert_readable_with(persistence_dir, cipher)
+    assert secrets_store.get_secret("QA_TOKEN") == SECRET_VALUE
+
+    # Writes go through and re-encrypt everything under the new key.
+    settings_store.update(
+        lambda s: _apply(s, {"misc_settings_diff": {"qa_note": True}})
+    )
+    secrets_store.set_secret("QA_OTHER", "x")
+
+    # The previous key is no longer needed ...
+    _assert_readable_with(persistence_dir, Cipher(KEY_B))
+    assert (
+        FileSecretsStore(persistence_dir, cipher=Cipher(KEY_B)).get_secret("QA_OTHER")
+        == "x"
+    )
+    # ... and the old key alone can no longer read anything.
+    old = FileSettingsStore(persistence_dir, cipher=Cipher(KEY_A)).load()
+    assert old is not None
+    assert isinstance(old.agent_settings.llm, LLM)
+    assert old.agent_settings.llm.api_key is None
+
+
+def test_reencrypt_rewrites_only_stale_files(persistence_dir):
+    settings_before, secrets_before = _seed(persistence_dir)
+
+    # A wrong previous key: nothing can be decrypted, nothing is rewritten.
+    wrong = Cipher(KEY_B, previous_keys=[KEY_C])
+    assert FileSettingsStore(persistence_dir, cipher=wrong).reencrypt() is False
+    assert FileSecretsStore(persistence_dir, cipher=wrong).reencrypt() is False
+    assert (persistence_dir / "settings.json").read_bytes() == settings_before
+    assert (persistence_dir / "secrets.json").read_bytes() == secrets_before
+
+    cipher = _rotated()
+    assert FileSettingsStore(persistence_dir, cipher=cipher).reencrypt() is True
+    assert FileSecretsStore(persistence_dir, cipher=cipher).reencrypt() is True
+    _assert_readable_with(persistence_dir, Cipher(KEY_B))
+
+    # Everything is current now: a second pass leaves the files alone.
+    settings_after = (persistence_dir / "settings.json").read_bytes()
+    secrets_after = (persistence_dir / "secrets.json").read_bytes()
+    assert FileSettingsStore(persistence_dir, cipher=cipher).reencrypt() is False
+    assert FileSecretsStore(persistence_dir, cipher=cipher).reencrypt() is False
+    assert (persistence_dir / "settings.json").read_bytes() == settings_after
+    assert (persistence_dir / "secrets.json").read_bytes() == secrets_after
+
+
+def test_reencrypt_stale_stores_at_startup(persistence_dir):
+    _seed(persistence_dir)
+    config = Config(
+        static_files_path=None,
+        session_api_keys=[],
+        secret_key=SecretStr(KEY_B),
+        previous_secret_keys=[SecretStr(KEY_A)],
+    )
+    reencrypt_stale_stores(config)
+    _assert_readable_with(persistence_dir, Cipher(KEY_B))
+
+
+def test_api_writes_succeed_after_rotation_with_previous_key(persistence_dir):
+    _seed(persistence_dir)
+    config = Config(
+        static_files_path=None,
+        session_api_keys=[],
+        secret_key=SecretStr(KEY_B),
+        previous_secret_keys=[SecretStr(KEY_A)],
+    )
+    client = TestClient(create_app(config))
+
+    assert client.get("/api/settings").json()["llm_api_key_is_set"] is True
+    assert client.get("/api/settings/secrets/QA_TOKEN").text == SECRET_VALUE
+    patch = client.patch(
+        "/api/settings", json={"misc_settings_diff": {"qa_note": True}}
+    )
+    assert patch.status_code == 200
+    put = client.put("/api/settings/secrets", json={"name": "QA_OTHER", "value": "x"})
+    assert put.status_code == 200
+    delete = client.delete("/api/settings/secrets/QA_OTHER")
+    assert delete.status_code == 200
+
+    # The writes re-encrypted both files: the new key alone now reads them.
+    reset_stores()
+    client = TestClient(
+        create_app(
+            Config(
+                static_files_path=None,
+                session_api_keys=[],
+                secret_key=SecretStr(KEY_B),
+            )
+        )
+    )
+    assert client.get("/api/settings").json()["llm_api_key_is_set"] is True
+    assert client.get("/api/settings/secrets/QA_TOKEN").text == SECRET_VALUE
+    assert (
+        client.patch(
+            "/api/settings", json={"misc_settings_diff": {"qa_note": False}}
+        ).status_code
+        == 200
+    )
+
+
+def test_api_refusal_names_previous_keys(persistence_dir):
+    _seed(persistence_dir)
+    config = Config(
+        static_files_path=None,
+        session_api_keys=[],
+        secret_key=SecretStr(KEY_B),
+        previous_secret_keys=[SecretStr(KEY_C)],
+    )
+    client = TestClient(create_app(config))
+    patch = client.patch(
+        "/api/settings", json={"misc_settings_diff": {"qa_note": True}}
+    )
+    assert patch.status_code == 409
+    assert "OH_PREVIOUS_SECRET_KEYS" in patch.json()["detail"]
+    put = client.put("/api/settings/secrets", json={"name": "QA_OTHER", "value": "x"})
+    # The server masks 500 details; the guidance is in the server log.
+    assert put.status_code == 500
