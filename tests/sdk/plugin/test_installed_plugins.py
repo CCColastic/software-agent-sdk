@@ -9,6 +9,7 @@ cloning and remain unchanged.
 """
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -193,6 +194,35 @@ def test_update_existing_plugin_local(
 
 def test_update_nonexistent_plugin(installed_dir: Path) -> None:
     assert update_plugin("nonexistent", installed_dir=installed_dir) is None
+
+
+def test_install_git_repo_root_without_manifest_is_named_after_repo(
+    tmp_path: Path, installed_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A manifest-less repository is named after the repository, not after
+    its ``<repo>-<hash>`` clone cache directory."""
+    monkeypatch.setattr(
+        "openhands.sdk.extensions.installation.manager.DEFAULT_CACHE_DIR",
+        tmp_path / "cache",
+    )
+    repo = tmp_path / "src" / "qa-src"
+    skill_dir = repo / "skills" / "hello"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: hello\ndescription: Say hello\n---\nhello\n"
+    )
+    git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run([*git, "init", "-q"], check=True)
+    subprocess.run([*git, "add", "."], check=True)
+    subprocess.run([*git, "commit", "-qm", "init"], check=True)
+
+    info = install_plugin(source=f"file://{repo}", installed_dir=installed_dir)
+
+    assert info.name == "qa-src"
+    assert info.install_path == installed_dir / "qa-src"
+    assert (installed_dir / "qa-src" / "skills" / "hello" / "SKILL.md").exists()
+    plugins = load_installed_plugins(installed_dir=installed_dir)
+    assert [p.name for p in plugins] == ["qa-src"]
 
 
 # ============================================================================
