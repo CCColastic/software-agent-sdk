@@ -573,6 +573,54 @@ async def test_outcome_reports_real_bucketed_usage(factory):
     assert "0.42" not in str(payload)
 
 
+async def test_outcome_reports_usage_from_the_live_event_order(factory):
+    """Regression: a live run's terminal status is a bare string update.
+
+    The server publishes ``stats`` key updates after each LLM call, then the
+    ``execution_status`` update (a bare string), and the ``full_state``
+    snapshot only afterwards. Usage must come from the ``stats`` updates seen
+    before the terminal status, not only from a terminal ``full_state``.
+    """
+    from openhands.sdk.conversation.state import ConversationExecutionStatus
+    from openhands.sdk.event.conversation_state import ConversationStateUpdateEvent
+    from openhands.sdk.llm.utils.metrics import Metrics
+
+    sink = CollectingSink()
+    sub = make_subscriber(sink, factory)
+    state = _real_state()
+    await sub(ConversationStateUpdateEvent.from_conversation_state(state))
+    await sub(
+        ConversationStateUpdateEvent(
+            key="execution_status", value=ConversationExecutionStatus.RUNNING.value
+        )
+    )
+
+    metrics = Metrics(model_name="deepseek/deepseek-chat")
+    metrics.add_cost(0.42)
+    metrics.add_token_usage(
+        prompt_tokens=12000,
+        completion_tokens=3000,
+        cache_read_tokens=0,
+        cache_write_tokens=0,
+        reasoning_tokens=0,
+        context_window=200000,
+        response_id="r",
+    )
+    state.stats.usage_to_metrics["default"] = metrics
+    # What EventService's stats callback publishes after each LLM call.
+    await sub(ConversationStateUpdateEvent(key="stats", value=state.stats))
+    await sub(
+        ConversationStateUpdateEvent(
+            key="execution_status", value=ConversationExecutionStatus.FINISHED.value
+        )
+    )
+
+    assert len(sink.events) == 1
+    payload = sink.events[0].to_payload()
+    assert payload["total_tokens_bucket"] == "10000-50000"
+    assert payload["cost_bucket"] == "0p1-1"
+
+
 def test_confirmation_policy_is_read_from_the_field_that_exists():
     """Regression: the field is confirmation_policy, not confirmation_mode.
 
