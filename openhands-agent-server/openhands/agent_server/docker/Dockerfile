@@ -619,6 +619,25 @@ RUN set -eux; \
     mkdir -p /etc/docker; \
     echo '{"mtu": 1450}' > /etc/docker/daemon.json
 
+# docker-ce-rootless-extras still bundles RootlessKit 3.2.0 with vulnerable x/net.
+RUN set -eux; \
+    case ",$INSTALL_CAPABILITIES," in \
+      *,docker,*) ;; \
+      *) exit 0;; \
+    esac; \
+    case "$(dpkg --print-architecture)" in \
+      amd64) arch=x86_64; sha256=0e757c8f80510d764df8c9a5f169805580b48d02329f0a200900e261ecec27ed;; \
+      arm64) arch=aarch64; sha256=7a159e79ef3e65e1f2702ab89537bb79de67b433428328b9626cf75786dbe43a;; \
+      *) echo "Unsupported RootlessKit architecture" >&2; exit 1;; \
+    esac; \
+    tmpdir=$(mktemp -d); \
+    curl -fsSL "https://github.com/rootless-containers/rootlesskit/releases/download/v3.3.0/rootlesskit-${arch}.tar.gz" -o "$tmpdir/rootlesskit.tar.gz"; \
+    echo "$sha256  $tmpdir/rootlesskit.tar.gz" | sha256sum -c -; \
+    tar -xzf "$tmpdir/rootlesskit.tar.gz" -C "$tmpdir" rootlesskit; \
+    install -m 0755 "$tmpdir/rootlesskit" /usr/bin/rootlesskit; \
+    rm -rf "$tmpdir"; \
+    test "$(rootlesskit --version)" = "rootlesskit version 3.3.0"
+
 # --- GitHub CLI ---
 RUN set -eux; \
     mkdir -p -m 755 /etc/apt/keyrings; \
