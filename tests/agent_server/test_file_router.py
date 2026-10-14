@@ -359,7 +359,10 @@ def test_upload_overwrite_keeps_file_mode(client, tmp_path):
     assert stat.S_IMODE(target_path.stat().st_mode) == 0o750
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="root can write read-only files")
+@pytest.mark.skipif(
+    getattr(os, "geteuid", lambda: -1)() == 0,
+    reason="root can write read-only files",
+)
 def test_upload_does_not_overwrite_read_only_file(client, tmp_path):
     """A read-only file is refused, as writing it in place was."""
     target_path = tmp_path / "locked.txt"
