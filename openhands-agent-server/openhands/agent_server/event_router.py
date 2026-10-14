@@ -212,10 +212,7 @@ async def batch_get_conversation_events(
 
 @event_write_router.post(
     "",
-    responses={
-        422: {"description": "Invalid message, including a role other than user"},
-        429: {"description": "Message saved but server run capacity is full"},
-    },
+    responses={429: {"description": "Message saved but server run capacity is full"}},
 )
 async def send_message(
     request: SendMessageRequest,
